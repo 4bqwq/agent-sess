@@ -5,7 +5,14 @@ from pathlib import Path
 
 from sess.errors import MetadataError, ProviderError, TargetError
 from sess.metadata import MetadataStore, validate_name
-from sess.models import Agent, Catalog, DeletionPreview, DeletionResult, Session
+from sess.models import (
+    Agent,
+    Catalog,
+    DeletionPreview,
+    DeletionResult,
+    Session,
+    SessionTrace,
+)
 from sess.paths import same_directory
 from sess.process import NativeProcessRunner
 from sess.providers import ClaudeProvider, CodexProvider
@@ -117,6 +124,11 @@ class SessionService:
         session = self.resolve(target)
         provider = self._provider_for(session.agent)
         return self.runner.run(provider.fork_argv(session.session_id, native_args))
+
+    def read_trace(self, target: str, all_turns: bool = False) -> SessionTrace:
+        session = self.resolve(target)
+        provider = self._provider_for(session.agent)
+        return provider.read_trace(session, all_turns)
 
     def preview_delete(self, session: Session) -> DeletionPreview:
         return self._provider_for(session.agent).preview_delete(session)

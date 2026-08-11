@@ -10,6 +10,7 @@ from sess.models import (
     DeletionResult,
     DiscoveryResult,
     Session,
+    SessionTrace,
 )
 from sess.process import NativeProcessRunner
 
@@ -30,6 +31,10 @@ class SessionProvider(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def read_trace(self, session: Session, all_turns: bool) -> SessionTrace:
+        raise NotImplementedError
+
+    @abstractmethod
     def preview_delete(self, session: Session) -> DeletionPreview:
         raise NotImplementedError
 
@@ -38,4 +43,3 @@ class SessionProvider(ABC):
         self, session: Session, runner: NativeProcessRunner
     ) -> DeletionResult:
         raise NotImplementedError
-

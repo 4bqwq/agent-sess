@@ -9,7 +9,7 @@ import pytest
 
 import sess.providers.claude as claude_module
 from sess.errors import ProviderError
-from sess.models import Agent, Session
+from sess.models import Agent, Session, TraceEventKind
 from sess.providers.claude import ClaudeProvider
 
 
@@ -142,6 +142,149 @@ def test_claude_passes_session_selection_flags_to_native_cli(flag):
     provider = make_provider(Path("/unused"))
 
     assert provider.resume_argv(SESSION_ID, [flag])[-1] == flag
+
+
+def test_claude_trace_uses_latest_human_turn_and_skips_thinking(tmp_path):
+    provider = make_provider(tmp_path)
+    current = tmp_path / "project"
+    current.mkdir()
+    transcript = (
+        provider.config_dir / "projects" / "encoded" / f"{SESSION_ID}.jsonl"
+    )
+    events = [
+        {
+            "type": "user",
+            "timestamp": "2026-08-11T01:00:00Z",
+            "message": {"role": "user", "content": "old request"},
+        },
+        {
+            "type": "assistant",
+            "timestamp": "2026-08-11T01:00:01Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "old answer"}],
+            },
+        },
+        {
+            "type": "user",
+            "timestamp": "2026-08-11T02:00:00Z",
+            "origin": {"kind": "human"},
+            "message": {"role": "user", "content": "latest request"},
+        },
+        {
+            "type": "user",
+            "timestamp": "2026-08-11T02:00:01Z",
+            "message": {
+                "role": "user",
+                "content": "<system-reminder>hidden instruction</system-reminder>",
+            },
+        },
+        {
+            "type": "assistant",
+            "timestamp": "2026-08-11T02:00:02Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "hidden thinking",
+                        "signature": "signed",
+                    }
+                ],
+            },
+        },
+        {
+            "type": "assistant",
+            "timestamp": "2026-08-11T02:00:03Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "checking files"}],
+            },
+        },
+        {
+            "type": "assistant",
+            "timestamp": "2026-08-11T02:00:04Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "tool-1",
+                        "name": "Bash",
+                        "input": {"command": "rg session"},
+                    }
+                ],
+            },
+        },
+        {
+            "type": "user",
+            "timestamp": "2026-08-11T02:00:05Z",
+            "sourceToolAssistantUUID": "assistant-1",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": "found session",
+                    }
+                ],
+            },
+        },
+        {
+            "type": "assistant",
+            "timestamp": "2026-08-11T02:00:06Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "latest answer"}],
+            },
+        },
+        {
+            "type": "assistant",
+            "timestamp": "2026-08-11T02:00:07Z",
+            "error": "authentication_failed",
+            "isApiErrorMessage": True,
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Please run /login · API Error: 401"}
+                ],
+            },
+        },
+    ]
+    write_jsonl(transcript, events)
+    timestamp = datetime(2026, 8, 11, tzinfo=timezone.utc)
+    session = Session(
+        agent=Agent.CLAUDE,
+        session_id=SESSION_ID,
+        cwd=current,
+        created_at=timestamp,
+        updated_at=timestamp,
+        transcript_path=transcript,
+    )
+
+    latest = provider.read_trace(session, all_turns=False)
+    latest_text = "\n".join(event.content for event in latest.events)
+    assert [event.kind for event in latest.events] == [
+        TraceEventKind.USER,
+        TraceEventKind.ASSISTANT,
+        TraceEventKind.TOOL_CALL,
+        TraceEventKind.TOOL_RESULT,
+        TraceEventKind.ASSISTANT,
+        TraceEventKind.ERROR,
+    ]
+    assert "latest request" in latest_text
+    assert "old request" not in latest_text
+    assert "hidden instruction" not in latest_text
+    assert "hidden thinking" not in latest_text
+    assert "API Error: 401" in latest_text
+    assert latest.events[2].label == "Bash"
+    assert latest.events[3].label == "Bash"
+
+    complete = provider.read_trace(session, all_turns=True)
+    complete_text = "\n".join(event.content for event in complete.events)
+    assert "old request" in complete_text
+    assert "old answer" in complete_text
 
 
 def create_deletion_fixture(tmp_path: Path):

@@ -4,7 +4,7 @@ import pytest
 
 from sess.cli import run, split_native_args
 from sess.metadata import MetadataStore
-from sess.models import Agent
+from sess.models import Agent, SessionTrace, TraceEvent, TraceEventKind
 from sess.service import SessionService
 
 from test_service import (
@@ -144,3 +144,33 @@ def test_cli_without_subcommand_keeps_non_tty_fallback(tmp_path, capsys):
     assert return_code == 0
     assert len(captured.out.strip().splitlines()) == 26
     assert sessions[0].session_id in captured.out
+
+
+def test_cli_print_writes_only_markdown_to_stdout(tmp_path, capsys, monkeypatch):
+    service, _ = make_service(tmp_path)
+    session = service.resolve(CODEX_ID)
+    calls: list[tuple[str, bool]] = []
+
+    def fake_read_trace(target, all_turns):
+        calls.append((target, all_turns))
+        return SessionTrace(
+            session=session,
+            all_turns=all_turns,
+            events=(TraceEvent(TraceEventKind.USER, "最新请求 🐈"),),
+            warnings=("trailing line ignored",),
+        )
+
+    monkeypatch.setattr(service, "read_trace", fake_read_trace)
+
+    return_code = run(
+        ["print", CODEX_ID[:8], "--all"],
+        service=service,
+    )
+
+    captured = capsys.readouterr()
+    assert return_code == 0
+    assert calls == [(CODEX_ID[:8], True)]
+    assert captured.out.startswith("# Session transcript\n")
+    assert "最新请求 🐈" in captured.out
+    assert "warning" not in captured.out
+    assert "sess warning: trailing line ignored" in captured.err

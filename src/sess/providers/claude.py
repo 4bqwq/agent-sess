@@ -15,11 +15,20 @@ from sess.models import (
     DeletionResult,
     DiscoveryResult,
     Session,
+    SessionTrace,
+    TraceEvent,
+    TraceEventKind,
 )
 from sess.paths import is_within, same_directory
 from sess.process import NativeProcessRunner
 from sess.providers.base import SessionProvider
-from sess.providers.common import is_full_uuid, parse_timestamp
+from sess.providers.common import (
+    content_as_text,
+    format_tool_input,
+    is_full_uuid,
+    iter_jsonl_snapshot,
+    parse_timestamp,
+)
 
 
 class ClaudeProvider(SessionProvider):
@@ -192,6 +201,147 @@ class ClaudeProvider(SessionProvider):
             "--fork-session",
             *native_args,
         ]
+
+    def read_trace(self, session: Session, all_turns: bool) -> SessionTrace:
+        if session.agent is not self.agent:
+            raise ProviderError("ClaudeProvider 收到了其他 Agent 的会话")
+
+        events: list[TraceEvent] = []
+        warnings: list[str] = []
+        tool_names: dict[str, str] = {}
+
+        for event in iter_jsonl_snapshot(
+            session.transcript_path, warnings, "Claude"
+        ):
+            if event.get("isSidechain") is True or event.get("isMeta") is True:
+                continue
+            timestamp = parse_timestamp(event.get("timestamp"))
+            event_type = event.get("type")
+            message = event.get("message")
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+
+            if event_type == "assistant":
+                if not isinstance(content, list):
+                    continue
+                text_kind = (
+                    TraceEventKind.ERROR
+                    if event.get("isApiErrorMessage") is True
+                    or event.get("error") is not None
+                    else TraceEventKind.ASSISTANT
+                )
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    block_type = block.get("type")
+                    if block_type == "text":
+                        text = block.get("text")
+                        if isinstance(text, str) and text:
+                            events.append(
+                                TraceEvent(
+                                    kind=text_kind,
+                                    content=text,
+                                    timestamp=timestamp,
+                                )
+                            )
+                    elif block_type == "tool_use":
+                        tool_name = block.get("name")
+                        if not isinstance(tool_name, str) or not tool_name:
+                            tool_name = "unknown"
+                        tool_id = block.get("id")
+                        if isinstance(tool_id, str):
+                            tool_names[tool_id] = tool_name
+                        tool_input, language = format_tool_input(block.get("input"))
+                        events.append(
+                            TraceEvent(
+                                kind=TraceEventKind.TOOL_CALL,
+                                content=tool_input,
+                                timestamp=timestamp,
+                                label=tool_name,
+                                language=language,
+                            )
+                        )
+                continue
+
+            if event_type != "user":
+                continue
+            if isinstance(content, str):
+                if not content or self._is_control_message(content):
+                    continue
+                if not all_turns:
+                    events.clear()
+                    tool_names.clear()
+                events.append(
+                    TraceEvent(
+                        kind=TraceEventKind.USER,
+                        content=content,
+                        timestamp=timestamp,
+                    )
+                )
+                continue
+            if not isinstance(content, list):
+                continue
+
+            human_texts: list[str] = []
+            tool_results: list[TraceEvent] = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                block_type = block.get("type")
+                if block_type == "text":
+                    text = block.get("text")
+                    if (
+                        isinstance(text, str)
+                        and text
+                        and not self._is_control_message(text)
+                    ):
+                        human_texts.append(text)
+                elif block_type == "tool_result":
+                    tool_id = block.get("tool_use_id")
+                    tool_name = (
+                        tool_names.get(tool_id, tool_id)
+                        if isinstance(tool_id, str)
+                        else None
+                    )
+                    tool_results.append(
+                        TraceEvent(
+                            kind=(
+                                TraceEventKind.TOOL_ERROR
+                                if block.get("is_error") is True
+                                else TraceEventKind.TOOL_RESULT
+                            ),
+                            content=content_as_text(block.get("content")),
+                            timestamp=timestamp,
+                            label=tool_name,
+                            language="text",
+                        )
+                    )
+
+            if human_texts:
+                if not all_turns:
+                    events.clear()
+                    tool_names.clear()
+                events.append(
+                    TraceEvent(
+                        kind=TraceEventKind.USER,
+                        content="\n\n".join(human_texts),
+                        timestamp=timestamp,
+                    )
+                )
+            events.extend(tool_results)
+
+        return SessionTrace(
+            session=session,
+            events=tuple(events),
+            all_turns=all_turns,
+            warnings=tuple(warnings),
+        )
+
+    @staticmethod
+    def _is_control_message(text: str) -> bool:
+        stripped = text.lstrip()
+        return stripped.startswith("<system-reminder>")
 
     def preview_delete(self, session: Session) -> DeletionPreview:
         self._assert_deletable_session(session)

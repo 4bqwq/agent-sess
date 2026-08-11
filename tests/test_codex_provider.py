@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
+from sess.models import Agent, Session, TraceEventKind
 from sess.providers.codex import CodexProvider
 
 
@@ -30,6 +32,18 @@ def meta_event(cwd: Path, *, originator: str = "codex-tui", source: object = "cl
             "source": source,
         },
     }
+
+
+def make_trace_session(transcript: Path, cwd: Path) -> Session:
+    timestamp = datetime(2026, 8, 11, tzinfo=timezone.utc)
+    return Session(
+        agent=Agent.CODEX,
+        session_id=SESSION_ID,
+        cwd=cwd,
+        created_at=timestamp,
+        updated_at=timestamp,
+        transcript_path=transcript,
+    )
 
 
 def test_discover_keeps_only_exact_interactive_cwd(tmp_path):
@@ -95,6 +109,174 @@ def test_codex_allows_config_short_flag():
     ]
 
 
+def test_codex_trace_uses_latest_task_and_excludes_control_content(tmp_path):
+    transcript = tmp_path / f"{SESSION_ID}.jsonl"
+    events = [
+        meta_event(tmp_path),
+        {
+            "timestamp": "2026-08-11T01:00:00Z",
+            "type": "event_msg",
+            "payload": {"type": "task_started"},
+        },
+        {
+            "timestamp": "2026-08-11T01:00:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "old request"}],
+            },
+        },
+        {
+            "timestamp": "2026-08-11T01:00:02Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": "old answer"}],
+            },
+        },
+        {
+            "timestamp": "2026-08-11T02:00:00Z",
+            "type": "event_msg",
+            "payload": {"type": "task_started"},
+        },
+        {
+            "timestamp": "2026-08-11T02:00:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "latest request"}],
+            },
+        },
+        {
+            "timestamp": "2026-08-11T02:00:02Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "<skill>hidden</skill>"}],
+            },
+        },
+        {
+            "timestamp": "2026-08-11T02:00:03Z",
+            "type": "response_item",
+            "payload": {
+                "type": "reasoning",
+                "summary": [
+                    "visible summary",
+                    {"type": "summary_text", "text": "second summary"},
+                ],
+                "encrypted_content": "hidden reasoning",
+            },
+        },
+        {
+            "timestamp": "2026-08-11T02:00:04Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "phase": "commentary",
+                "content": [{"type": "output_text", "text": "checking files"}],
+            },
+        },
+        {
+            "timestamp": "2026-08-11T02:00:05Z",
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "call_id": "call-1",
+                "input": json.dumps({"cmd": "rg session"}),
+            },
+        },
+        {
+            "timestamp": "2026-08-11T02:00:06Z",
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "call-1",
+                "output": [{"type": "input_text", "text": "found session"}],
+            },
+        },
+        {
+            "timestamp": "2026-08-11T02:00:07Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": "latest answer"}],
+            },
+        },
+        {
+            "timestamp": "2026-08-11T02:00:08Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "error": {
+                    "message": "stream disconnected",
+                    "codex_error_info": "other",
+                },
+            },
+        },
+    ]
+    write_jsonl(transcript, events)
+    provider = CodexProvider(codex_home=tmp_path)
+    session = make_trace_session(transcript, tmp_path)
+
+    latest = provider.read_trace(session, all_turns=False)
+    latest_text = "\n".join(event.content for event in latest.events)
+    assert [event.kind for event in latest.events] == [
+        TraceEventKind.USER,
+        TraceEventKind.REASONING,
+        TraceEventKind.ASSISTANT,
+        TraceEventKind.TOOL_CALL,
+        TraceEventKind.TOOL_RESULT,
+        TraceEventKind.ASSISTANT,
+        TraceEventKind.ERROR,
+    ]
+    assert "latest request" in latest_text
+    assert "old request" not in latest_text
+    assert "<skill>" not in latest_text
+    assert "hidden reasoning" not in latest_text
+    assert "second summary" in latest_text
+    assert "stream disconnected" in latest_text
+    assert latest.events[3].label == "exec"
+    assert latest.events[3].language == "json"
+    assert latest.events[4].label == "exec"
+
+    complete = provider.read_trace(session, all_turns=True)
+    complete_text = "\n".join(event.content for event in complete.events)
+    assert "old request" in complete_text
+    assert "old answer" in complete_text
+    assert "<skill>" not in complete_text
+
+
+def test_codex_trace_ignores_an_incomplete_trailing_line(tmp_path):
+    transcript = tmp_path / f"{SESSION_ID}.jsonl"
+    event = {
+        "timestamp": "2026-08-11T01:00:00Z",
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "request"}],
+        },
+    }
+    transcript.write_text(json.dumps(event) + "\n{\"partial\"", encoding="utf-8")
+    provider = CodexProvider(codex_home=tmp_path)
+
+    trace = provider.read_trace(
+        make_trace_session(transcript, tmp_path), all_turns=False
+    )
+
+    assert [item.content for item in trace.events] == ["request"]
+    assert any("尚未完整写入的末行" in warning for warning in trace.warnings)
+
+
 def test_codex_delete_uses_native_force_and_verifies_transcript(tmp_path):
     transcript = tmp_path / f"{SESSION_ID}.jsonl"
     transcript.write_text("{}\n", encoding="utf-8")
@@ -109,10 +291,6 @@ def test_codex_delete_uses_native_force_and_verifies_transcript(tmp_path):
             return 0
 
     runner = Runner()
-    from datetime import datetime, timezone
-
-    from sess.models import Agent, Session
-
     model = Session(
         agent=Agent.CODEX,
         session_id=SESSION_ID,

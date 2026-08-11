@@ -5,21 +5,39 @@ import os
 from collections.abc import Sequence
 from pathlib import Path
 
+from sess.errors import ProviderError
 from sess.models import (
     Agent,
     DeletionPreview,
     DeletionResult,
     DiscoveryResult,
     Session,
+    SessionTrace,
+    TraceEvent,
+    TraceEventKind,
 )
 from sess.paths import same_directory
 from sess.process import NativeProcessRunner
 from sess.providers.base import SessionProvider
-from sess.providers.common import is_full_uuid, parse_timestamp
+from sess.providers.common import (
+    content_as_text,
+    format_tool_input,
+    is_full_uuid,
+    iter_jsonl_snapshot,
+    parse_timestamp,
+)
 
 
 class CodexProvider(SessionProvider):
     agent = Agent.CODEX
+    _CONTROL_MESSAGE_PREFIXES = (
+        "# AGENTS.md instructions for ",
+        "<environment_context>",
+        "<skill>",
+        "<permissions instructions>",
+        "<apps_instructions>",
+        "<plugins_instructions>",
+    )
 
     def __init__(self, codex_home: Path | None = None, executable: str = "codex") -> None:
         configured_home = os.environ.get("CODEX_HOME")
@@ -130,6 +148,187 @@ class CodexProvider(SessionProvider):
 
     def fork_argv(self, session_id: str, native_args: Sequence[str]) -> list[str]:
         return [self.executable, "fork", session_id, *native_args]
+
+    def read_trace(self, session: Session, all_turns: bool) -> SessionTrace:
+        if session.agent is not self.agent:
+            raise ProviderError("CodexProvider 收到了其他 Agent 的会话")
+
+        events: list[TraceEvent] = []
+        warnings: list[str] = []
+        tool_names: dict[str, str] = {}
+        has_task_boundaries = False
+
+        for event in iter_jsonl_snapshot(
+            session.transcript_path, warnings, "Codex"
+        ):
+            timestamp = parse_timestamp(event.get("timestamp"))
+            event_type = event.get("type")
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+
+            if event_type == "event_msg":
+                message_type = payload.get("type")
+                if message_type == "task_started":
+                    has_task_boundaries = True
+                    if not all_turns:
+                        events.clear()
+                        tool_names.clear()
+                    continue
+                if message_type in {"error", "stream_error"}:
+                    error_value = payload.get("message", payload.get("error"))
+                    if error_value is not None:
+                        events.append(
+                            TraceEvent(
+                                kind=TraceEventKind.ERROR,
+                                content=content_as_text(error_value),
+                                timestamp=timestamp,
+                            )
+                        )
+                elif message_type == "task_complete":
+                    error_value = payload.get("error")
+                    if error_value is not None:
+                        events.append(
+                            TraceEvent(
+                                kind=TraceEventKind.ERROR,
+                                content=content_as_text(error_value),
+                                timestamp=timestamp,
+                            )
+                        )
+                continue
+
+            if event_type != "response_item":
+                continue
+            item_type = payload.get("type")
+            if item_type == "message":
+                role = payload.get("role")
+                texts = self._message_texts(payload.get("content"))
+                if role == "user":
+                    texts = [
+                        text for text in texts if not self._is_control_message(text)
+                    ]
+                    if not texts:
+                        continue
+                    if not all_turns and not has_task_boundaries:
+                        events.clear()
+                        tool_names.clear()
+                    events.append(
+                        TraceEvent(
+                            kind=TraceEventKind.USER,
+                            content="\n\n".join(texts),
+                            timestamp=timestamp,
+                        )
+                    )
+                elif role == "assistant" and texts:
+                    phase = payload.get("phase")
+                    label = (
+                        "Commentary"
+                        if phase == "commentary"
+                        else "Final"
+                        if phase == "final_answer"
+                        else None
+                    )
+                    events.append(
+                        TraceEvent(
+                            kind=TraceEventKind.ASSISTANT,
+                            content="\n\n".join(texts),
+                            timestamp=timestamp,
+                            label=label,
+                        )
+                    )
+                continue
+
+            if item_type == "reasoning":
+                summary = payload.get("summary")
+                if isinstance(summary, list):
+                    parts: list[str] = []
+                    for part in summary:
+                        if isinstance(part, str) and part:
+                            parts.append(part)
+                        elif isinstance(part, dict):
+                            text = part.get("text")
+                            if isinstance(text, str) and text:
+                                parts.append(text)
+                    if parts:
+                        events.append(
+                            TraceEvent(
+                                kind=TraceEventKind.REASONING,
+                                content="\n\n".join(parts),
+                                timestamp=timestamp,
+                            )
+                        )
+                continue
+
+            if item_type in {"custom_tool_call", "function_call"}:
+                tool_name = payload.get("name")
+                if not isinstance(tool_name, str) or not tool_name:
+                    tool_name = "unknown"
+                call_id = payload.get("call_id")
+                if isinstance(call_id, str):
+                    tool_names[call_id] = tool_name
+                raw_input = (
+                    payload.get("input")
+                    if item_type == "custom_tool_call"
+                    else payload.get("arguments")
+                )
+                content, language = format_tool_input(raw_input)
+                events.append(
+                    TraceEvent(
+                        kind=TraceEventKind.TOOL_CALL,
+                        content=content,
+                        timestamp=timestamp,
+                        label=tool_name,
+                        language=language,
+                    )
+                )
+                continue
+
+            if item_type in {"custom_tool_call_output", "function_call_output"}:
+                call_id = payload.get("call_id")
+                tool_name = (
+                    tool_names.get(call_id, call_id)
+                    if isinstance(call_id, str)
+                    else None
+                )
+                output = content_as_text(payload.get("output"))
+                events.append(
+                    TraceEvent(
+                        kind=TraceEventKind.TOOL_RESULT,
+                        content=output,
+                        timestamp=timestamp,
+                        label=tool_name,
+                        language="text",
+                    )
+                )
+
+        return SessionTrace(
+            session=session,
+            events=tuple(events),
+            all_turns=all_turns,
+            warnings=tuple(warnings),
+        )
+
+    @staticmethod
+    def _message_texts(value: object) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        texts: list[str] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") not in {"input_text", "output_text", "text"}:
+                continue
+            text = item.get("text")
+            if isinstance(text, str) and text:
+                texts.append(text)
+        return texts
+
+    @classmethod
+    def _is_control_message(cls, text: str) -> bool:
+        stripped = text.lstrip()
+        return any(
+            stripped.startswith(prefix) for prefix in cls._CONTROL_MESSAGE_PREFIXES
+        )
 
     def preview_delete(self, session: Session) -> DeletionPreview:
         return DeletionPreview(

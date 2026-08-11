@@ -10,6 +10,7 @@ from sess.errors import SessError
 from sess.models import Catalog
 from sess.service import SessionService
 from sess.tui import SessionTui, render_plain
+from sess.transcript import render_trace_markdown
 
 
 DEFAULT_LIST_PAGE_SIZE = 20
@@ -58,6 +59,15 @@ def build_parser() -> argparse.ArgumentParser:
     fork_parser = subparsers.add_parser("fork", help="分叉并进入一个新会话")
     fork_parser.add_argument("target", metavar="ID|name|prefix")
 
+    print_parser = subparsers.add_parser("print", help="输出会话轨迹的 Markdown 源码")
+    print_parser.add_argument("target", metavar="ID|name|prefix")
+    print_parser.add_argument(
+        "--all",
+        dest="all_turns",
+        action="store_true",
+        help="输出整个 session，而不是最后一轮",
+    )
+
     delete_parser = subparsers.add_parser("del", help="从硬盘永久删除一个会话")
     delete_parser.add_argument("target", metavar="ID|name|prefix")
     delete_parser.add_argument(
@@ -105,6 +115,12 @@ def run(argv: Sequence[str] | None = None, service: SessionService | None = None
             return 0
         if command == "fork":
             return selected_service.fork(namespace.target, native_args)
+        if command == "print":
+            return _run_print(
+                selected_service,
+                namespace.target,
+                all_turns=namespace.all_turns,
+            )
         if command == "del":
             return _run_delete(selected_service, namespace.target, namespace.yes)
         parser.error(f"未知命令: {command}")
@@ -158,6 +174,26 @@ def _run_list(service: SessionService, page: int, show_all: bool) -> int:
 def _emit_warnings(catalog: Catalog) -> None:
     for warning in catalog.warnings:
         print(f"sess warning: {warning}", file=sys.stderr)
+
+
+def _run_print(
+    service: SessionService, target: str, all_turns: bool
+) -> int:
+    trace = service.read_trace(target, all_turns)
+    _write_utf8_stdout(render_trace_markdown(trace))
+    for warning in trace.warnings:
+        print(f"sess warning: {warning}", file=sys.stderr)
+    return 0
+
+
+def _write_utf8_stdout(value: str) -> None:
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is None:
+        sys.stdout.write(value)
+        return
+    sys.stdout.flush()
+    buffer.write(value.encode("utf-8"))
+    buffer.flush()
 
 
 def _run_delete(service: SessionService, target: str, assume_yes: bool) -> int:

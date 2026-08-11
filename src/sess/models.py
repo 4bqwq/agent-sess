@@ -11,6 +11,16 @@ class Agent(str, Enum):
     CLAUDE = "claude"
 
 
+class TraceEventKind(str, Enum):
+    USER = "user"
+    ASSISTANT = "assistant"
+    REASONING = "reasoning"
+    TOOL_CALL = "tool_call"
+    TOOL_RESULT = "tool_result"
+    TOOL_ERROR = "tool_error"
+    ERROR = "error"
+
+
 @dataclass(frozen=True, slots=True)
 class Session:
     agent: Agent
@@ -55,3 +65,19 @@ class DeletionResult:
     def success(self) -> bool:
         return not self.remaining
 
+
+@dataclass(frozen=True, slots=True)
+class TraceEvent:
+    kind: TraceEventKind
+    content: str
+    timestamp: datetime | None = None
+    label: str | None = None
+    language: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SessionTrace:
+    session: Session
+    events: tuple[TraceEvent, ...]
+    all_turns: bool
+    warnings: tuple[str, ...] = ()

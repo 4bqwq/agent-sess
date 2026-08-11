@@ -1,6 +1,6 @@
 # sess
 
-`sess` 在一个终端界面中管理当前目录的 Codex CLI 和 Claude Code 本地交互式会话。它读取两个工具已经写入硬盘的 transcript，并提供统一的列表、恢复、本地命名、分叉和永久删除命令。
+`sess` 在一个终端界面中管理当前目录的 Codex CLI 和 Claude Code 本地交互式会话。它读取两个工具已经写入硬盘的 transcript，并提供统一的列表、轨迹输出、恢复、本地命名、分叉和永久删除命令。
 
 `sess` 不保存模型、Provider、base URL、认证令牌或会话历史。恢复和分叉仍由原生 `codex`、`claude` 命令完成，每次启动所需的环境变量和 CLI 参数由用户重新传入。
 
@@ -61,6 +61,22 @@ sess ls --all
 | `q` | 退出 |
 
 当标准输入或标准输出不是交互式终端时，`sess` 保留普通文本输出的兼容行为，不会自动恢复会话。
+
+## 输出会话轨迹
+
+目标可以使用完整 session ID、当前项目内完全匹配的 `sess` 名称，或至少 8 个字符的唯一 session ID 前缀：
+
+```bash
+sess print <ID-or-name-or-prefix>
+sess print <ID-or-name-or-prefix> --all
+sess print 019fee45 > transcript.md
+```
+
+默认只输出当前会话最近一轮用户请求及其后续执行轨迹；`--all` 输出整个会话。正文是按时间顺序排列的 UTF-8 Markdown 源码，包括用户消息、可见的助手消息、公开的 reasoning summary、工具调用的完整参数、工具返回的完整结果和错误。
+
+系统提示、developer 指令、token 统计、加密 reasoning 和 Claude Code 的 thinking 内容不会进入输出。子 Agent 只按主 transcript 中已有的工具调用和结果显示，不递归读取子 Agent 自己的 transcript。
+
+Markdown 只写入标准输出。读取活跃会话时，`sess print` 会对命令启动时已经存在的完整 JSONL 记录做一次快照；如果文件末尾恰好有一行仍在写入，该行会被跳过，说明写入标准错误，因此重定向文件仍然只包含 Markdown。
 
 ## 恢复会话
 
@@ -157,6 +173,6 @@ Claude Code 默认将 transcript 保存为：
 uv run pytest
 ```
 
-测试使用脱敏的临时 transcript，覆盖实际目录身份判断、交互式会话识别、唯一 ID 前缀、名称元数据、参数透传、TUI 与静态列表分页、原生命令构造和 Claude Code 单会话删除。测试不会删除用户现有的 Codex 或 Claude Code 会话。
+测试使用脱敏的临时 transcript，覆盖实际目录身份判断、交互式会话识别、唯一 ID 前缀、名称元数据、参数透传、TUI 与静态列表分页、Codex 和 Claude Code 轨迹解析、Markdown 输出、原生命令构造和 Claude Code 单会话删除。测试不会删除用户现有的 Codex 或 Claude Code 会话。
 
 更详细的产品边界和实现依据保存在 `.agent/work/` 下的设计文档中。

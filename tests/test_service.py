@@ -13,6 +13,7 @@ from sess.models import (
     DeletionResult,
     DiscoveryResult,
     Session,
+    SessionTrace,
 )
 from sess.providers.base import SessionProvider
 from sess.service import SessionService
@@ -35,6 +36,9 @@ class StubProvider(SessionProvider):
 
     def fork_argv(self, session_id, native_args):
         return [self.agent.value, "fork", session_id, *native_args]
+
+    def read_trace(self, session, all_turns):
+        return SessionTrace(session=session, events=(), all_turns=all_turns)
 
     def preview_delete(self, session):
         return DeletionPreview((str(session.transcript_path),))
@@ -161,6 +165,15 @@ def test_resume_and_fork_pass_native_arguments_to_provider(tmp_path):
         ["codex", "resume", CODEX_ID, "-c", "model=x"],
         ["claude", "fork", CLAUDE_ID, "--model", "x"],
     ]
+
+
+def test_read_trace_resolves_prefix_and_delegates_to_provider(tmp_path):
+    service, _ = make_service(tmp_path)
+
+    trace = service.read_trace(CODEX_ID[:8], all_turns=True)
+
+    assert trace.session.session_id == CODEX_ID
+    assert trace.all_turns is True
 
 
 def test_delete_removes_name_only_after_provider_success(tmp_path):
