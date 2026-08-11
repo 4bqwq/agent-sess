@@ -6,10 +6,13 @@ from pathlib import Path
 from sess.errors import MetadataError, ProviderError, TargetError
 from sess.metadata import MetadataStore, validate_name
 from sess.models import Agent, Catalog, DeletionPreview, DeletionResult, Session
-from sess.paths import canonical_path
+from sess.paths import same_directory
 from sess.process import NativeProcessRunner
 from sess.providers import ClaudeProvider, CodexProvider
 from sess.providers.base import SessionProvider
+
+
+MIN_SESSION_ID_PREFIX_LENGTH = 8
 
 
 class SessionService:
@@ -33,7 +36,6 @@ class SessionService:
     def catalog(self) -> Catalog:
         sessions: list[Session] = []
         warnings: list[str] = []
-        target_cwd = canonical_path(self.project_dir)
         for provider in self.providers.values():
             try:
                 result = provider.discover(self.project_dir)
@@ -43,7 +45,7 @@ class SessionService:
             sessions.extend(
                 session
                 for session in result.sessions
-                if canonical_path(session.cwd) == target_cwd
+                if same_directory(session.cwd, self.project_dir)
             )
             warnings.extend(result.warnings)
 
@@ -68,8 +70,23 @@ class SessionService:
         ]
         if name_matches:
             return self._one_match(target, name_matches)
+
+        normalized_target = target.lower()
+        prefix_matches = [
+            session
+            for session in selected_catalog.sessions
+            if session.session_id.lower().startswith(normalized_target)
+        ]
+        if prefix_matches:
+            if len(target) < MIN_SESSION_ID_PREFIX_LENGTH:
+                raise TargetError(
+                    "session ID 前缀至少需要 "
+                    f"{MIN_SESSION_ID_PREFIX_LENGTH} 个字符: {target!r}"
+                )
+            return self._one_match(target, prefix_matches)
         raise TargetError(
-            f"当前目录中找不到完整 session ID 或完全匹配的名称: {target!r}"
+            "当前目录中找不到完整 session ID、完全匹配的名称或唯一 ID 前缀: "
+            f"{target!r}"
         )
 
     @staticmethod

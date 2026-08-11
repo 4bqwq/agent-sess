@@ -12,7 +12,7 @@ from sess.models import (
     DiscoveryResult,
     Session,
 )
-from sess.paths import canonical_path
+from sess.paths import same_directory
 from sess.process import NativeProcessRunner
 from sess.providers.base import SessionProvider
 from sess.providers.common import is_full_uuid, parse_timestamp
@@ -37,7 +37,6 @@ class CodexProvider(SessionProvider):
         if not sessions_root.exists():
             return DiscoveryResult()
 
-        target_cwd = canonical_path(current_dir)
         sessions: list[Session] = []
         warnings: list[str] = []
         try:
@@ -46,14 +45,14 @@ class CodexProvider(SessionProvider):
             return DiscoveryResult(warnings=(f"无法扫描 Codex 会话目录 {sessions_root}: {exc}",))
 
         for transcript_path in transcript_paths:
-            session, file_warnings = self._read_transcript(transcript_path, target_cwd)
+            session, file_warnings = self._read_transcript(transcript_path, current_dir)
             warnings.extend(file_warnings)
             if session is not None:
                 sessions.append(session)
         return DiscoveryResult(tuple(sessions), tuple(warnings))
 
     def _read_transcript(
-        self, transcript_path: Path, target_cwd: str
+        self, transcript_path: Path, target_cwd: Path
     ) -> tuple[Session | None, list[str]]:
         warnings: list[str] = []
         session_id: str | None = None
@@ -97,7 +96,7 @@ class CodexProvider(SessionProvider):
                     if not is_full_uuid(raw_id):
                         warnings.append(f"Codex session_meta 包含无效 session ID: {transcript_path}")
                         break
-                    if canonical_path(raw_cwd) != target_cwd:
+                    if not same_directory(raw_cwd, target_cwd):
                         break
                     if timestamp is None:
                         warnings.append(f"Codex session_meta 缺少有效 timestamp: {transcript_path}")

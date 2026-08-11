@@ -16,7 +16,7 @@ from sess.models import (
     DiscoveryResult,
     Session,
 )
-from sess.paths import canonical_path, is_within
+from sess.paths import is_within, same_directory
 from sess.process import NativeProcessRunner
 from sess.providers.base import SessionProvider
 from sess.providers.common import is_full_uuid, parse_timestamp
@@ -79,7 +79,6 @@ class ClaudeProvider(SessionProvider):
         if not projects_root.exists():
             return DiscoveryResult()
 
-        target_cwd = canonical_path(current_dir)
         sessions: list[Session] = []
         warnings: list[str] = []
         try:
@@ -90,14 +89,14 @@ class ClaudeProvider(SessionProvider):
             )
 
         for transcript_path in transcript_paths:
-            session, file_warnings = self._read_transcript(transcript_path, target_cwd)
+            session, file_warnings = self._read_transcript(transcript_path, current_dir)
             warnings.extend(file_warnings)
             if session is not None:
                 sessions.append(session)
         return DiscoveryResult(tuple(sessions), tuple(warnings))
 
     def _read_transcript(
-        self, transcript_path: Path, target_cwd: str
+        self, transcript_path: Path, target_cwd: Path
     ) -> tuple[Session | None, list[str]]:
         warnings: list[str] = []
         session_id: str | None = None
@@ -162,7 +161,7 @@ class ClaudeProvider(SessionProvider):
         if not is_full_uuid(session_id):
             warnings.append(f"Claude transcript 包含无效 session ID: {transcript_path}")
             return None, warnings
-        if canonical_path(cwd) != target_cwd:
+        if not same_directory(cwd, target_cwd):
             return None, warnings
 
         if transcript_path.stem != session_id:
@@ -394,12 +393,11 @@ class ClaudeProvider(SessionProvider):
         projects = document.get("projects")
         if not isinstance(projects, dict):
             return False
-        target_cwd = canonical_path(session.cwd)
         for project_path, value in projects.items():
             if (
                 isinstance(project_path, str)
                 and isinstance(value, dict)
-                and canonical_path(project_path) == target_cwd
+                and same_directory(project_path, session.cwd)
                 and value.get("lastSessionId") == session.session_id
             ):
                 return True
@@ -417,12 +415,11 @@ class ClaudeProvider(SessionProvider):
         if not isinstance(projects, dict):
             return False
 
-        target_cwd = canonical_path(session.cwd)
         changed = False
         for project_path, value in projects.items():
             if not isinstance(project_path, str) or not isinstance(value, dict):
                 continue
-            if canonical_path(project_path) != target_cwd:
+            if not same_directory(project_path, session.cwd):
                 continue
             if value.get("lastSessionId") != session.session_id:
                 continue

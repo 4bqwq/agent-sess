@@ -9,7 +9,20 @@ from pathlib import Path
 from sess.errors import SessError
 from sess.models import Catalog
 from sess.service import SessionService
-from sess.tui import SessionTui
+from sess.tui import SessionTui, render_plain
+
+
+DEFAULT_LIST_PAGE_SIZE = 20
+
+
+def positive_page(value: str) -> int:
+    try:
+        page = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("页码必须是正整数") from exc
+    if page < 1:
+        raise argparse.ArgumentTypeError("页码必须是正整数")
+    return page
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -19,20 +32,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command")
 
-    subparsers.add_parser("ls", help="打开当前目录的会话列表")
+    list_parser = subparsers.add_parser("ls", help="输出当前目录的会话列表")
+    list_scope = list_parser.add_mutually_exclusive_group()
+    list_scope.add_argument(
+        "--page",
+        type=positive_page,
+        default=1,
+        metavar="N",
+        help=f"输出第 N 页（默认每页 {DEFAULT_LIST_PAGE_SIZE} 条）",
+    )
+    list_scope.add_argument(
+        "--all",
+        dest="show_all",
+        action="store_true",
+        help="输出全部会话",
+    )
 
     resume_parser = subparsers.add_parser("resume", help="恢复一个会话")
-    resume_parser.add_argument("target", metavar="ID|name")
+    resume_parser.add_argument("target", metavar="ID|name|prefix")
 
     rename_parser = subparsers.add_parser("rename", help="设置 sess 本地名称")
-    rename_parser.add_argument("target", metavar="ID|name")
+    rename_parser.add_argument("target", metavar="ID|name|prefix")
     rename_parser.add_argument("new_name", metavar="new-name")
 
     fork_parser = subparsers.add_parser("fork", help="分叉并进入一个新会话")
-    fork_parser.add_argument("target", metavar="ID|name")
+    fork_parser.add_argument("target", metavar="ID|name|prefix")
 
     delete_parser = subparsers.add_parser("del", help="从硬盘永久删除一个会话")
-    delete_parser.add_argument("target", metavar="ID|name")
+    delete_parser.add_argument("target", metavar="ID|name|prefix")
     delete_parser.add_argument(
         "--yes", action="store_true", help="跳过确认；只允许搭配完整 session ID"
     )
@@ -53,15 +80,21 @@ def run(argv: Sequence[str] | None = None, service: SessionService | None = None
     sess_arguments, native_args = split_native_args(arguments)
     parser = build_parser()
     namespace = parser.parse_args(sess_arguments)
-    command = namespace.command or "ls"
+    command = namespace.command
 
     if native_args and command not in {"resume", "fork"}:
         parser.error("只有 resume 和 fork 支持在 -- 后透传原生参数")
 
     selected_service = service or SessionService(Path.cwd())
     try:
+        if command is None:
+            return _run_interactive(selected_service)
         if command == "ls":
-            return _run_list(selected_service)
+            return _run_list(
+                selected_service,
+                page=namespace.page,
+                show_all=namespace.show_all,
+            )
         if command == "resume":
             return selected_service.resume(namespace.target, native_args)
         if command == "rename":
@@ -83,13 +116,43 @@ def run(argv: Sequence[str] | None = None, service: SessionService | None = None
     return 2
 
 
-def _run_list(service: SessionService) -> int:
+def _run_interactive(service: SessionService) -> int:
     catalog = service.catalog()
     selected = SessionTui(catalog, service.project_dir).run()
     _emit_warnings(catalog)
     if selected is None:
         return 0
     return service.resume_session(selected)
+
+
+def _run_list(service: SessionService, page: int, show_all: bool) -> int:
+    catalog = service.catalog()
+    total_sessions = len(catalog.sessions)
+    if show_all:
+        visible_catalog = catalog
+    else:
+        total_pages = max(
+            1,
+            (total_sessions + DEFAULT_LIST_PAGE_SIZE - 1)
+            // DEFAULT_LIST_PAGE_SIZE,
+        )
+        if page > total_pages:
+            raise SessError(
+                f"页码 {page} 超出范围；当前共有 {total_pages} 页、"
+                f"{total_sessions} 条会话"
+            )
+        start = (page - 1) * DEFAULT_LIST_PAGE_SIZE
+        stop = start + DEFAULT_LIST_PAGE_SIZE
+        visible_catalog = Catalog(catalog.sessions[start:stop])
+
+    print(render_plain(visible_catalog))
+    _emit_warnings(catalog)
+    if not show_all and total_sessions > DEFAULT_LIST_PAGE_SIZE:
+        print(
+            f"sess: 第 {page}/{total_pages} 页，共 {total_sessions} 条会话",
+            file=sys.stderr,
+        )
+    return 0
 
 
 def _emit_warnings(catalog: Catalog) -> None:
@@ -100,7 +163,9 @@ def _emit_warnings(catalog: Catalog) -> None:
 def _run_delete(service: SessionService, target: str, assume_yes: bool) -> int:
     session = service.resolve(target)
     if assume_yes and not _is_full_uuid(target, session.session_id):
-        raise SessError("--yes 只能与完整 session ID 一起使用，不能与名称搭配")
+        raise SessError(
+            "--yes 只能与完整 session ID 一起使用，不能与名称或 ID 前缀搭配"
+        )
     preview = service.preview_delete(session)
 
     print(
@@ -129,7 +194,7 @@ def _run_delete(service: SessionService, target: str, assume_yes: bool) -> int:
 
 
 def _is_full_uuid(target: str, session_id: str) -> bool:
-    if target != session_id:
+    if target.lower() != session_id.lower():
         return False
     try:
         return str(uuid.UUID(target)) == target.lower()

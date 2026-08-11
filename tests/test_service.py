@@ -113,14 +113,49 @@ def test_resolve_uses_full_id_or_exact_name(tmp_path):
 
     assert service.resolve(CODEX_ID).agent is Agent.CODEX
     assert service.resolve("feature-a").session_id == CODEX_ID
+    assert service.resolve(CODEX_ID[:8]).session_id == CODEX_ID
+    assert service.resolve(CODEX_ID[:8].upper()).session_id == CODEX_ID
     with pytest.raises(TargetError):
         service.resolve("feature")
+
+
+def test_resolve_requires_at_least_eight_characters_for_id_prefix(tmp_path):
+    service, _ = make_service(tmp_path)
+
+    with pytest.raises(TargetError, match="至少需要 8 个字符"):
+        service.resolve(CODEX_ID[:7])
+
+
+def test_exact_name_takes_precedence_over_an_id_prefix(tmp_path):
+    service, _ = make_service(tmp_path)
+    service.rename(CLAUDE_ID, CODEX_ID[:8])
+
+    assert service.resolve(CODEX_ID[:8]).session_id == CLAUDE_ID
+
+
+def test_ambiguous_id_prefix_lists_all_candidates(tmp_path):
+    similar_id = "019fec4f-ffff-4000-8000-000000000001"
+    first = make_session(Agent.CODEX, CODEX_ID, tmp_path, 1)
+    second = make_session(Agent.CODEX, similar_id, tmp_path, 2)
+    provider = StubProvider(Agent.CODEX, (first, second))
+    service = SessionService(
+        tmp_path,
+        (provider,),
+        MetadataStore(tmp_path),
+        CapturingRunner(),
+    )
+
+    with pytest.raises(TargetError, match="对应多个会话") as error:
+        service.resolve(CODEX_ID[:8])
+
+    assert CODEX_ID in str(error.value)
+    assert similar_id in str(error.value)
 
 
 def test_resume_and_fork_pass_native_arguments_to_provider(tmp_path):
     service, runner = make_service(tmp_path)
 
-    assert service.resume(CODEX_ID, ["-c", "model=x"]) == 0
+    assert service.resume(CODEX_ID[:8], ["-c", "model=x"]) == 0
     assert service.fork(CLAUDE_ID, ["--model", "x"]) == 0
     assert runner.calls == [
         ["codex", "resume", CODEX_ID, "-c", "model=x"],
