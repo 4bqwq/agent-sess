@@ -30,6 +30,7 @@ class Session:
     updated_at: datetime
     transcript_path: Path
     name: str | None = None
+    forked_from_id: str | None = None
 
     @property
     def metadata_key(self) -> str:
@@ -81,3 +82,29 @@ class SessionTrace:
     events: tuple[TraceEvent, ...]
     all_turns: bool
     warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationTurn:
+    user: str
+    assistant: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SessionConversation:
+    session: Session
+    turns: tuple[ConversationTurn, ...]
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class SessionLaunch:
+    argv: tuple[str, ...]
+    expected_session_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LaunchResult:
+    return_code: int
+    session: Session | None = None
+    name: str | None = None

@@ -7,10 +7,10 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from sess.errors import SessError
-from sess.models import Catalog
+from sess.models import Catalog, LaunchResult
 from sess.service import SessionService
 from sess.tui import SessionTui, render_plain
-from sess.transcript import render_trace_markdown
+from sess.transcript import render_conversation_markdown, render_trace_markdown
 
 
 DEFAULT_LIST_PAGE_SIZE = 20
@@ -24,6 +24,16 @@ def positive_page(value: str) -> int:
     if page < 1:
         raise argparse.ArgumentTypeError("页码必须是正整数")
     return page
+
+
+def positive_turn_count(value: str) -> int:
+    try:
+        count = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("显示轮数必须是正整数") from exc
+    if count < 1:
+        raise argparse.ArgumentTypeError("显示轮数必须是正整数")
+    return count
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -49,6 +59,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="输出全部会话",
     )
 
+    new_parser = subparsers.add_parser("new", help="启动一个新的 Codex 会话")
+    new_parser.add_argument("name", nargs="?", metavar="name")
+    new_parser.add_argument(
+        "--fork",
+        dest="fork_target",
+        metavar="ID|name|prefix",
+        help="从指定会话分叉；未指定 name 时自动命名",
+    )
+
     resume_parser = subparsers.add_parser("resume", help="恢复一个会话")
     resume_parser.add_argument("target", metavar="ID|name|prefix")
 
@@ -66,6 +85,20 @@ def build_parser() -> argparse.ArgumentParser:
         dest="all_turns",
         action="store_true",
         help="输出整个 session，而不是最后一轮",
+    )
+
+    path_parser = subparsers.add_parser("path", help="输出原始 transcript 的绝对路径")
+    path_parser.add_argument("target", metavar="ID|name|prefix")
+
+    show_parser = subparsers.add_parser("show", help="显示最近的最终问答")
+    show_parser.add_argument("target", metavar="ID|name|prefix")
+    show_parser.add_argument(
+        "-n",
+        "--turns",
+        type=positive_turn_count,
+        default=1,
+        metavar="N",
+        help="显示最近 N 轮最终问答（默认 1）",
     )
 
     delete_parser = subparsers.add_parser("del", help="从硬盘永久删除一个会话")
@@ -92,8 +125,8 @@ def run(argv: Sequence[str] | None = None, service: SessionService | None = None
     namespace = parser.parse_args(sess_arguments)
     command = namespace.command
 
-    if native_args and command not in {"resume", "fork"}:
-        parser.error("只有 resume 和 fork 支持在 -- 后透传原生参数")
+    if native_args and command not in {"new", "resume", "fork"}:
+        parser.error("只有 new、resume 和 fork 支持在 -- 后透传原生参数")
 
     selected_service = service or SessionService(Path.cwd())
     try:
@@ -105,6 +138,20 @@ def run(argv: Sequence[str] | None = None, service: SessionService | None = None
                 page=namespace.page,
                 show_all=namespace.show_all,
             )
+        if command == "new":
+            result = selected_service.new(
+                name=namespace.name,
+                fork_target=namespace.fork_target,
+                native_args=native_args,
+            )
+            _emit_launch_name(
+                result,
+                automatic=(
+                    namespace.name is None
+                    and namespace.fork_target is not None
+                ),
+            )
+            return result.return_code
         if command == "resume":
             return selected_service.resume(namespace.target, native_args)
         if command == "rename":
@@ -114,12 +161,23 @@ def run(argv: Sequence[str] | None = None, service: SessionService | None = None
             )
             return 0
         if command == "fork":
-            return selected_service.fork(namespace.target, native_args)
+            result = selected_service.fork(namespace.target, native_args)
+            _emit_launch_name(result, automatic=True)
+            return result.return_code
         if command == "print":
             return _run_print(
                 selected_service,
                 namespace.target,
                 all_turns=namespace.all_turns,
+            )
+        if command == "path":
+            print(selected_service.transcript_path(namespace.target))
+            return 0
+        if command == "show":
+            return _run_show(
+                selected_service,
+                namespace.target,
+                turn_count=namespace.turns,
             )
         if command == "del":
             return _run_delete(selected_service, namespace.target, namespace.yes)
@@ -176,12 +234,32 @@ def _emit_warnings(catalog: Catalog) -> None:
         print(f"sess warning: {warning}", file=sys.stderr)
 
 
+def _emit_launch_name(result: LaunchResult, *, automatic: bool) -> None:
+    if result.session is None or result.name is None:
+        return
+    action = "已自动命名" if automatic else "已命名"
+    print(
+        f"{action} {result.session.agent.value}:{result.session.session_id}"
+        f" -> {result.name}"
+    )
+
+
 def _run_print(
     service: SessionService, target: str, all_turns: bool
 ) -> int:
     trace = service.read_trace(target, all_turns)
     _write_utf8_stdout(render_trace_markdown(trace))
     for warning in trace.warnings:
+        print(f"sess warning: {warning}", file=sys.stderr)
+    return 0
+
+
+def _run_show(
+    service: SessionService, target: str, turn_count: int
+) -> int:
+    conversation = service.read_conversation(target, turn_count)
+    _write_utf8_stdout(render_conversation_markdown(conversation))
+    for warning in conversation.warnings:
         print(f"sess warning: {warning}", file=sys.stderr)
     return 0
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -111,6 +112,42 @@ def test_discover_excludes_sdk_and_requires_exact_cwd(tmp_path):
     assert result.sessions[0].updated_at.hour == 2
 
 
+def test_discover_new_only_reads_paths_created_after_snapshot(tmp_path):
+    provider = make_provider(tmp_path)
+    current = tmp_path / "project"
+    current.mkdir()
+    project_store = provider.config_dir / "projects" / "encoded"
+    write_jsonl(
+        project_store / f"{SESSION_ID}.jsonl",
+        [
+            claude_event(
+                current,
+                SESSION_ID,
+                "2026-08-11T01:00:00Z",
+                entrypoint="cli",
+                prompt_source="typed",
+            )
+        ],
+    )
+    snapshot = provider.snapshot_transcript_paths()
+    write_jsonl(
+        project_store / f"{OTHER_ID}.jsonl",
+        [
+            claude_event(
+                current,
+                OTHER_ID,
+                "2026-08-11T02:00:00Z",
+                entrypoint="cli",
+                prompt_source="typed",
+            )
+        ],
+    )
+
+    result = provider.discover_new(current, snapshot)
+
+    assert [session.session_id for session in result.sessions] == [OTHER_ID]
+
+
 def test_claude_commands_preserve_forwarded_argument_order():
     provider = ClaudeProvider(
         config_dir=Path("/unused"),
@@ -131,6 +168,47 @@ def test_claude_commands_preserve_forwarded_argument_order():
         SESSION_ID,
         "--fork-session",
         *native_args,
+    ]
+
+
+def test_claude_prepare_fork_reserves_a_child_session_id(tmp_path, monkeypatch):
+    provider = make_provider(tmp_path)
+    child_id = uuid.UUID(OTHER_ID)
+    monkeypatch.setattr(claude_module.uuid, "uuid4", lambda: child_id)
+
+    launch = provider.prepare_fork(SESSION_ID, ["--model", "test-model"])
+
+    assert launch.expected_session_id == OTHER_ID
+    assert list(launch.argv) == [
+        "claude-test",
+        "--resume",
+        SESSION_ID,
+        "--fork-session",
+        "--session-id",
+        OTHER_ID,
+        "--model",
+        "test-model",
+    ]
+
+
+def test_claude_prepare_fork_uses_a_forwarded_child_session_id(tmp_path):
+    provider = make_provider(tmp_path)
+
+    launch = provider.prepare_fork(
+        SESSION_ID,
+        ["--session-id", OTHER_ID, "--model", "test-model"],
+    )
+
+    assert launch.expected_session_id == OTHER_ID
+    assert list(launch.argv) == [
+        "claude-test",
+        "--resume",
+        SESSION_ID,
+        "--fork-session",
+        "--session-id",
+        OTHER_ID,
+        "--model",
+        "test-model",
     ]
 
 
@@ -285,6 +363,19 @@ def test_claude_trace_uses_latest_human_turn_and_skips_thinking(tmp_path):
     complete_text = "\n".join(event.content for event in complete.events)
     assert "old request" in complete_text
     assert "old answer" in complete_text
+
+    conversation = provider.read_conversation(session)
+    assert [turn.user for turn in conversation.turns] == [
+        "old request",
+        "latest request",
+    ]
+    assert [turn.assistant for turn in conversation.turns] == [
+        "old answer",
+        "latest answer",
+    ]
+    assert "checking files" not in "\n".join(
+        turn.assistant or "" for turn in conversation.turns
+    )
 
 
 def create_deletion_fixture(tmp_path: Path):

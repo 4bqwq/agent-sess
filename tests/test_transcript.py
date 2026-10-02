@@ -5,12 +5,14 @@ from pathlib import Path
 
 from sess.models import (
     Agent,
+    ConversationTurn,
     Session,
+    SessionConversation,
     SessionTrace,
     TraceEvent,
     TraceEventKind,
 )
-from sess.transcript import render_trace_markdown
+from sess.transcript import render_conversation_markdown, render_trace_markdown
 
 
 def make_trace() -> SessionTrace:
@@ -88,3 +90,23 @@ def test_trace_markdown_marks_full_session_scope():
     )
 
     assert "- Scope: full session" in render_trace_markdown(complete)
+
+
+def test_conversation_markdown_shows_final_turns_and_marks_missing_output():
+    trace = make_trace()
+    conversation = SessionConversation(
+        session=trace.session,
+        turns=(
+            ConversationTurn("first question", "first answer"),
+            ConversationTurn("second question"),
+        ),
+    )
+
+    rendered = render_conversation_markdown(conversation)
+
+    assert rendered.startswith("# Session conversation\n")
+    assert "- Name: `feature-a`" in rendered
+    assert "## Turn 1\n\n### User\n\nfirst question" in rendered
+    assert "### Assistant\n\nfirst answer" in rendered
+    assert "## Turn 2\n\n### User\n\nsecond question" in rendered
+    assert rendered.endswith("### Assistant\n\n（尚无最终输出）\n")

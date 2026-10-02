@@ -5,6 +5,7 @@ import os
 import shutil
 import stat
 import tempfile
+import uuid
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
@@ -14,7 +15,10 @@ from sess.models import (
     DeletionPreview,
     DeletionResult,
     DiscoveryResult,
+    ConversationTurn,
     Session,
+    SessionConversation,
+    SessionLaunch,
     SessionTrace,
     TraceEvent,
     TraceEventKind,
@@ -84,19 +88,53 @@ class ClaudeProvider(SessionProvider):
         self.executable = executable
 
     def discover(self, current_dir: Path) -> DiscoveryResult:
-        projects_root = self.config_dir / "projects"
-        if not projects_root.exists():
-            return DiscoveryResult()
-
-        sessions: list[Session] = []
-        warnings: list[str] = []
         try:
-            transcript_paths = sorted(projects_root.glob("*/*.jsonl"))
+            transcript_paths = self._transcript_paths()
         except OSError as exc:
             return DiscoveryResult(
-                warnings=(f"无法扫描 Claude Code 会话目录 {projects_root}: {exc}",)
+                warnings=(
+                    f"无法扫描 Claude Code 会话目录 "
+                    f"{self.config_dir / 'projects'}: {exc}",
+                )
             )
+        return self._discover_paths(transcript_paths, current_dir)
 
+    def snapshot_transcript_paths(self) -> frozenset[Path]:
+        try:
+            return frozenset(self._transcript_paths())
+        except OSError as exc:
+            raise ProviderError(
+                f"无法扫描 Claude Code 会话目录 "
+                f"{self.config_dir / 'projects'}: {exc}"
+            ) from exc
+
+    def discover_new(
+        self, current_dir: Path, known_paths: frozenset[Path]
+    ) -> DiscoveryResult:
+        try:
+            transcript_paths = tuple(
+                path
+                for path in self._transcript_paths()
+                if path not in known_paths
+            )
+        except OSError as exc:
+            raise ProviderError(
+                f"无法扫描 Claude Code 会话目录 "
+                f"{self.config_dir / 'projects'}: {exc}"
+            ) from exc
+        return self._discover_paths(transcript_paths, current_dir)
+
+    def _transcript_paths(self) -> tuple[Path, ...]:
+        projects_root = self.config_dir / "projects"
+        if not projects_root.exists():
+            return ()
+        return tuple(sorted(projects_root.glob("*/*.jsonl")))
+
+    def _discover_paths(
+        self, transcript_paths: Sequence[Path], current_dir: Path
+    ) -> DiscoveryResult:
+        sessions: list[Session] = []
+        warnings: list[str] = []
         for transcript_path in transcript_paths:
             session, file_warnings = self._read_transcript(transcript_path, current_dir)
             warnings.extend(file_warnings)
@@ -201,6 +239,41 @@ class ClaudeProvider(SessionProvider):
             "--fork-session",
             *native_args,
         ]
+
+    def prepare_fork(
+        self, session_id: str, native_args: Sequence[str]
+    ) -> SessionLaunch:
+        arguments = list(native_args)
+        supplied_ids: list[str] = []
+        for index, argument in enumerate(arguments):
+            if argument == "--session-id":
+                if index + 1 >= len(arguments):
+                    raise ProviderError("Claude --session-id 缺少 UUID 参数")
+                supplied_ids.append(arguments[index + 1])
+            elif argument.startswith("--session-id="):
+                supplied_ids.append(argument.partition("=")[2])
+
+        if len(supplied_ids) > 1:
+            raise ProviderError("Claude fork 只能指定一个 --session-id")
+        if supplied_ids:
+            child_session_id = supplied_ids[0]
+            if not is_full_uuid(child_session_id):
+                raise ProviderError(
+                    f"Claude --session-id 必须是完整 UUID: {child_session_id!r}"
+                )
+            argv = self.fork_argv(session_id, arguments)
+        else:
+            child_session_id = str(uuid.uuid4())
+            argv = [
+                self.executable,
+                "--resume",
+                session_id,
+                "--fork-session",
+                "--session-id",
+                child_session_id,
+                *arguments,
+            ]
+        return SessionLaunch(tuple(argv), child_session_id)
 
     def read_trace(self, session: Session, all_turns: bool) -> SessionTrace:
         if session.agent is not self.agent:
@@ -335,6 +408,80 @@ class ClaudeProvider(SessionProvider):
             session=session,
             events=tuple(events),
             all_turns=all_turns,
+            warnings=tuple(warnings),
+        )
+
+    def read_conversation(self, session: Session) -> SessionConversation:
+        if session.agent is not self.agent:
+            raise ProviderError("ClaudeProvider 收到了其他 Agent 的会话")
+
+        questions: list[str] = []
+        answers: list[str | None] = []
+        warnings: list[str] = []
+
+        for event in iter_jsonl_snapshot(
+            session.transcript_path, warnings, "Claude"
+        ):
+            if event.get("isSidechain") is True or event.get("isMeta") is True:
+                continue
+            event_type = event.get("type")
+            message = event.get("message")
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+
+            if event_type == "assistant":
+                if not questions or not isinstance(content, list):
+                    continue
+                text_parts: list[str] = []
+                has_tool_use = False
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "tool_use":
+                        has_tool_use = True
+                    elif block.get("type") == "text":
+                        text = block.get("text")
+                        if isinstance(text, str) and text:
+                            text_parts.append(text)
+
+                if has_tool_use:
+                    answers[-1] = None
+                elif (
+                    text_parts
+                    and event.get("isApiErrorMessage") is not True
+                    and event.get("error") is None
+                ):
+                    answers[-1] = "\n\n".join(text_parts)
+                continue
+
+            if event_type != "user" or event.get("sourceToolAssistantUUID"):
+                continue
+            human_texts: list[str] = []
+            if isinstance(content, str):
+                if content and not self._is_control_message(content):
+                    human_texts.append(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict) or block.get("type") != "text":
+                        continue
+                    text = block.get("text")
+                    if (
+                        isinstance(text, str)
+                        and text
+                        and not self._is_control_message(text)
+                    ):
+                        human_texts.append(text)
+            if human_texts:
+                questions.append("\n\n".join(human_texts))
+                answers.append(None)
+
+        return SessionConversation(
+            session=session,
+            turns=tuple(
+                ConversationTurn(user=question, assistant=answer)
+                for question, answer in zip(questions, answers)
+            ),
             warnings=tuple(warnings),
         )
 

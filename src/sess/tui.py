@@ -76,21 +76,32 @@ def format_time(value: datetime) -> str:
 
 
 def render_plain(catalog: Catalog) -> str:
-    header = "AGENT\tNAME\tSESSION_ID\tCREATED\tUPDATED"
-    rows = [header]
-    for session in catalog.sessions:
-        rows.append(
-            "\t".join(
-                (
-                    session.agent.value,
-                    session.name or "",
-                    session.session_id,
-                    format_time(session.created_at),
-                    format_time(session.updated_at),
-                )
+    rows = [
+        ("AGENT", "NAME", "SESSION_ID", "CREATED", "UPDATED"),
+        *(
+            (
+                session.agent.value,
+                session.name or "",
+                session.session_id,
+                format_time(session.created_at),
+                format_time(session.updated_at),
             )
+            for session in catalog.sessions
+        ),
+    ]
+    widths = [
+        max(display_width(safe_display_text(row[column])) for row in rows)
+        for column in range(len(rows[0]))
+    ]
+    return "\n".join(
+        "  ".join(
+            fit_cell(value, widths[column])
+            if column < len(row) - 1
+            else safe_display_text(value)
+            for column, value in enumerate(row)
         )
-    return "\n".join(rows)
+        for row in rows
+    )
 
 
 def render_screen(

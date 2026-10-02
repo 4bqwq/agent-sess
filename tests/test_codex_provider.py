@@ -11,6 +11,7 @@ from sess.providers.codex import CodexProvider
 
 
 SESSION_ID = "019fec4f-4ba2-7700-9fbf-a55f74a2dca7"
+FORKED_SESSION_ID = "019ff0ca-1692-7eb0-bded-7c744980f79f"
 
 
 def write_jsonl(path: Path, events: list[object], invalid_line: bool = False) -> None:
@@ -21,12 +22,19 @@ def write_jsonl(path: Path, events: list[object], invalid_line: bool = False) ->
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def meta_event(cwd: Path, *, originator: str = "codex-tui", source: object = "cli"):
+def meta_event(
+    cwd: Path,
+    *,
+    session_id: str = SESSION_ID,
+    timestamp: str = "2026-08-11T00:00:00Z",
+    originator: str = "codex-tui",
+    source: object = "cli",
+):
     return {
-        "timestamp": "2026-08-11T00:00:00Z",
+        "timestamp": timestamp,
         "type": "session_meta",
         "payload": {
-            "id": SESSION_ID,
+            "id": session_id,
             "cwd": str(cwd),
             "originator": originator,
             "source": source,
@@ -75,10 +83,85 @@ def test_discover_keeps_only_exact_interactive_cwd(tmp_path):
     assert any("无效 JSON 行" in warning for warning in result.warnings)
 
 
+def test_discover_new_only_reads_paths_created_after_snapshot(tmp_path):
+    codex_home = tmp_path / "codex-home"
+    current = tmp_path / "project"
+    current.mkdir()
+    sessions = codex_home / "sessions" / "2026" / "08" / "11"
+    existing = sessions / f"rollout-existing-{SESSION_ID}.jsonl"
+    write_jsonl(existing, [meta_event(current)])
+    provider = CodexProvider(codex_home=codex_home)
+    snapshot = provider.snapshot_transcript_paths()
+
+    write_jsonl(
+        sessions / f"rollout-new-{FORKED_SESSION_ID}.jsonl",
+        [meta_event(current, session_id=FORKED_SESSION_ID)],
+    )
+
+    result = provider.discover_new(current, snapshot)
+
+    assert [session.session_id for session in result.sessions] == [
+        FORKED_SESSION_ID
+    ]
+
+
+def test_discover_fork_keeps_child_identity_from_first_session_meta(tmp_path):
+    codex_home = tmp_path / "codex-home"
+    current = tmp_path / "project"
+    current.mkdir()
+    sessions = codex_home / "sessions" / "2026" / "08" / "11"
+
+    write_jsonl(
+        sessions / f"rollout-parent-{SESSION_ID}.jsonl",
+        [
+            meta_event(
+                current,
+                timestamp="2026-08-03T13:27:51Z",
+            ),
+            {"timestamp": "2026-08-11T11:57:00Z", "type": "event_msg"},
+        ],
+    )
+    child_meta = meta_event(
+        current,
+        session_id=FORKED_SESSION_ID,
+        timestamp="2026-08-11T12:26:46Z",
+    )
+    child_meta["payload"]["forked_from_id"] = SESSION_ID
+    write_jsonl(
+        sessions / f"rollout-child-{FORKED_SESSION_ID}.jsonl",
+        [
+            child_meta,
+            meta_event(
+                current,
+                timestamp="2026-08-11T12:26:46Z",
+            ),
+            {"timestamp": "2026-08-11T12:38:00Z", "type": "event_msg"},
+        ],
+    )
+
+    result = CodexProvider(codex_home=codex_home).discover(current)
+
+    assert {session.session_id for session in result.sessions} == {
+        SESSION_ID,
+        FORKED_SESSION_ID,
+    }
+    forked = next(
+        session
+        for session in result.sessions
+        if session.session_id == FORKED_SESSION_ID
+    )
+    assert forked.created_at.hour == 12
+    assert forked.created_at.minute == 26
+    assert forked.updated_at.hour == 12
+    assert forked.updated_at.minute == 38
+    assert forked.forked_from_id == SESSION_ID
+
+
 def test_codex_commands_preserve_forwarded_argument_order():
     provider = CodexProvider(codex_home=Path("/unused"), executable="codex-test")
     native_args = ["-c", 'model="gpt-test"', "--model", "gpt-test", "prompt"]
 
+    assert provider.new_argv(native_args) == ["codex-test", *native_args]
     assert provider.resume_argv(SESSION_ID, native_args) == [
         "codex-test",
         "resume",
@@ -254,6 +337,19 @@ def test_codex_trace_uses_latest_task_and_excludes_control_content(tmp_path):
     assert "old answer" in complete_text
     assert "<skill>" not in complete_text
 
+    conversation = provider.read_conversation(session)
+    assert [turn.user for turn in conversation.turns] == [
+        "old request",
+        "latest request",
+    ]
+    assert [turn.assistant for turn in conversation.turns] == [
+        "old answer",
+        "latest answer",
+    ]
+    assert "checking files" not in "\n".join(
+        turn.assistant or "" for turn in conversation.turns
+    )
+
 
 def test_codex_trace_ignores_an_incomplete_trailing_line(tmp_path):
     transcript = tmp_path / f"{SESSION_ID}.jsonl"
@@ -275,6 +371,12 @@ def test_codex_trace_ignores_an_incomplete_trailing_line(tmp_path):
 
     assert [item.content for item in trace.events] == ["request"]
     assert any("尚未完整写入的末行" in warning for warning in trace.warnings)
+
+    conversation = provider.read_conversation(
+        make_trace_session(transcript, tmp_path)
+    )
+    assert conversation.turns[0].user == "request"
+    assert conversation.turns[0].assistant is None
 
 
 def test_codex_delete_uses_native_force_and_verifies_transcript(tmp_path):

@@ -11,7 +11,9 @@ from sess.models import (
     DeletionPreview,
     DeletionResult,
     DiscoveryResult,
+    ConversationTurn,
     Session,
+    SessionConversation,
     SessionTrace,
     TraceEvent,
     TraceEventKind,
@@ -51,17 +53,53 @@ class CodexProvider(SessionProvider):
         self.executable = executable
 
     def discover(self, current_dir: Path) -> DiscoveryResult:
+        try:
+            transcript_paths = self._transcript_paths()
+        except OSError as exc:
+            return DiscoveryResult(
+                warnings=(
+                    f"无法扫描 Codex 会话目录 "
+                    f"{self.codex_home / 'sessions'}: {exc}",
+                )
+            )
+        return self._discover_paths(transcript_paths, current_dir)
+
+    def snapshot_transcript_paths(self) -> frozenset[Path]:
+        try:
+            return frozenset(self._transcript_paths())
+        except OSError as exc:
+            raise ProviderError(
+                f"无法扫描 Codex 会话目录 "
+                f"{self.codex_home / 'sessions'}: {exc}"
+            ) from exc
+
+    def discover_new(
+        self, current_dir: Path, known_paths: frozenset[Path]
+    ) -> DiscoveryResult:
+        try:
+            transcript_paths = tuple(
+                path
+                for path in self._transcript_paths()
+                if path not in known_paths
+            )
+        except OSError as exc:
+            raise ProviderError(
+                f"无法扫描 Codex 会话目录 "
+                f"{self.codex_home / 'sessions'}: {exc}"
+            ) from exc
+        return self._discover_paths(transcript_paths, current_dir)
+
+    def _transcript_paths(self) -> tuple[Path, ...]:
         sessions_root = self.codex_home / "sessions"
         if not sessions_root.exists():
-            return DiscoveryResult()
+            return ()
+        return tuple(sorted(sessions_root.rglob("*.jsonl")))
 
+    def _discover_paths(
+        self, transcript_paths: Sequence[Path], current_dir: Path
+    ) -> DiscoveryResult:
         sessions: list[Session] = []
         warnings: list[str] = []
-        try:
-            transcript_paths = sorted(sessions_root.rglob("*.jsonl"))
-        except OSError as exc:
-            return DiscoveryResult(warnings=(f"无法扫描 Codex 会话目录 {sessions_root}: {exc}",))
-
         for transcript_path in transcript_paths:
             session, file_warnings = self._read_transcript(transcript_path, current_dir)
             warnings.extend(file_warnings)
@@ -78,6 +116,7 @@ class CodexProvider(SessionProvider):
         created_at = None
         updated_at = None
         matched = False
+        forked_from_id: str | None = None
 
         try:
             with transcript_path.open("r", encoding="utf-8") as handle:
@@ -101,6 +140,11 @@ class CodexProvider(SessionProvider):
 
                     if event.get("type") != "session_meta":
                         continue
+                    if matched:
+                        # Fork rollouts copy the parent transcript after the
+                        # child's own metadata. Those copied records must not
+                        # replace the identity of the rollout being scanned.
+                        continue
                     payload = event.get("payload")
                     if not isinstance(payload, dict):
                         break
@@ -122,6 +166,17 @@ class CodexProvider(SessionProvider):
                     session_id = raw_id
                     cwd = raw_cwd
                     created_at = timestamp
+                    raw_parent_id = payload.get(
+                        "forked_from_id"
+                    ) or payload.get("parent_thread_id")
+                    if raw_parent_id is not None:
+                        if is_full_uuid(raw_parent_id):
+                            forked_from_id = raw_parent_id
+                        else:
+                            warnings.append(
+                                "Codex session_meta 包含无效的父 session ID: "
+                                f"{transcript_path}"
+                            )
                     matched = True
         except (OSError, UnicodeError) as exc:
             warnings.append(f"无法读取 Codex transcript {transcript_path}: {exc}")
@@ -139,12 +194,16 @@ class CodexProvider(SessionProvider):
                 created_at=created_at,
                 updated_at=updated_at,
                 transcript_path=transcript_path,
+                forked_from_id=forked_from_id,
             ),
             warnings,
         )
 
     def resume_argv(self, session_id: str, native_args: Sequence[str]) -> list[str]:
         return [self.executable, "resume", session_id, *native_args]
+
+    def new_argv(self, native_args: Sequence[str]) -> list[str]:
+        return [self.executable, *native_args]
 
     def fork_argv(self, session_id: str, native_args: Sequence[str]) -> list[str]:
         return [self.executable, "fork", session_id, *native_args]
@@ -305,6 +364,76 @@ class CodexProvider(SessionProvider):
             session=session,
             events=tuple(events),
             all_turns=all_turns,
+            warnings=tuple(warnings),
+        )
+
+    def read_conversation(self, session: Session) -> SessionConversation:
+        if session.agent is not self.agent:
+            raise ProviderError("CodexProvider 收到了其他 Agent 的会话")
+
+        questions: list[str] = []
+        final_answers: list[list[str]] = []
+        fallback_answers: list[str | None] = []
+        warnings: list[str] = []
+
+        for event in iter_jsonl_snapshot(
+            session.transcript_path, warnings, "Codex"
+        ):
+            if event.get("type") != "response_item":
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            item_type = payload.get("type")
+
+            if item_type == "message":
+                role = payload.get("role")
+                texts = self._message_texts(payload.get("content"))
+                if role == "user":
+                    texts = [
+                        text
+                        for text in texts
+                        if not self._is_control_message(text)
+                    ]
+                    if texts:
+                        questions.append("\n\n".join(texts))
+                        final_answers.append([])
+                        fallback_answers.append(None)
+                    continue
+                if role != "assistant" or not texts or not questions:
+                    continue
+
+                answer = "\n\n".join(texts)
+                phase = payload.get("phase")
+                if phase == "final_answer":
+                    final_answers[-1].append(answer)
+                elif phase != "commentary":
+                    fallback_answers[-1] = answer
+                continue
+
+            if (
+                item_type in {"custom_tool_call", "function_call"}
+                and questions
+                and not final_answers[-1]
+            ):
+                fallback_answers[-1] = None
+
+        turns = tuple(
+            ConversationTurn(
+                user=question,
+                assistant=(
+                    "\n\n".join(answer_parts)
+                    if answer_parts
+                    else fallback_answer
+                ),
+            )
+            for question, answer_parts, fallback_answer in zip(
+                questions, final_answers, fallback_answers
+            )
+        )
+        return SessionConversation(
+            session=session,
+            turns=turns,
             warnings=tuple(warnings),
         )
 

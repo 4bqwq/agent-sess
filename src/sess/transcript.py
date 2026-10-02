@@ -4,7 +4,49 @@ import re
 from dataclasses import replace
 from datetime import datetime
 
-from sess.models import SessionTrace, TraceEvent, TraceEventKind
+from sess.models import (
+    SessionConversation,
+    SessionTrace,
+    TraceEvent,
+    TraceEventKind,
+)
+
+
+def render_conversation_markdown(conversation: SessionConversation) -> str:
+    session = conversation.session
+    lines = [
+        "# Session conversation",
+        "",
+        f"- Agent: {_inline_code(session.agent.value)}",
+        f"- Session ID: {_inline_code(session.session_id)}",
+    ]
+    if session.name:
+        lines.append(f"- Name: {_inline_code(session.name)}")
+    lines.extend(
+        (
+            f"- Created: {_format_time(session.created_at)}",
+            f"- Updated: {_format_time(session.updated_at)}",
+        )
+    )
+
+    if not conversation.turns:
+        lines.extend(("", "当前会话没有可显示的用户轮次。"))
+    for index, turn in enumerate(conversation.turns, start=1):
+        lines.extend(
+            (
+                "",
+                f"## Turn {index}",
+                "",
+                "### User",
+                "",
+                turn.user,
+                "",
+                "### Assistant",
+                "",
+                turn.assistant or "（尚无最终输出）",
+            )
+        )
+    return "\n".join(lines) + "\n"
 
 
 def render_trace_markdown(trace: SessionTrace) -> str:

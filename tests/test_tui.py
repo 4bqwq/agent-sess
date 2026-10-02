@@ -4,7 +4,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from sess.models import Agent, Catalog, Session
-from sess.tui import fit_cell, move_selection, render_plain, render_screen
+from sess.tui import (
+    display_width,
+    fit_cell,
+    format_time,
+    move_selection,
+    render_plain,
+    render_screen,
+)
 
 
 def make_session(index: int) -> Session:
@@ -41,7 +48,17 @@ def test_renderers_include_required_columns_and_full_selected_id():
     catalog = Catalog(sessions)
 
     plain = render_plain(catalog)
-    assert "AGENT\tNAME\tSESSION_ID\tCREATED\tUPDATED" in plain
+    lines = plain.splitlines()
+    assert "\t" not in plain
+    header_id_column = display_width(lines[0][: lines[0].index("SESSION_ID")])
+    header_created_column = display_width(lines[0][: lines[0].index("CREATED")])
+    header_updated_column = display_width(lines[0][: lines[0].index("UPDATED")])
+    for line, session in zip(lines[1:], sessions):
+        assert display_width(line[: line.index(session.session_id)]) == header_id_column
+        created = format_time(session.created_at)
+        updated = format_time(session.updated_at)
+        assert display_width(line[: line.index(created)]) == header_created_column
+        assert display_width(line[: line.rindex(updated)]) == header_updated_column
 
     screen = render_screen(catalog, Path("/project"), 1, 100, 14)
     assert "AGENT" in screen
