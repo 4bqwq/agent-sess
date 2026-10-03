@@ -215,6 +215,21 @@ class SessionService:
                 final=final,
             )
             if child is None:
+                if (
+                    final
+                    and provider.agent is Agent.CODEX
+                    and discovery.warnings
+                ):
+                    naming_failure = (
+                        "，未完成命名"
+                        if requested_name is not None or parent is not None
+                        else ""
+                    )
+                    details = "\n".join(discovery.warnings)
+                    raise ProviderError(
+                        f"发现新增会话记录，但无法识别本次会话{naming_failure}；"
+                        f"原生记录保持不变。\n原因：{details}"
+                    )
                 return False
 
             if requested_name is not None:

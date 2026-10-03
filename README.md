@@ -50,6 +50,8 @@ sess ls --all
 
 两个入口都只列出原生会话元数据中 `cwd` 指向当前实际目录的交互式会话。WSL 的 Windows 挂载目录即使大小写写法不同，只要文件系统确认它们是同一个目录，也会匹配；父目录、子目录、其他项目、归档会话、`codex exec` 和 `claude -p` 会话不会进入列表。
 
+Codex 会话要求 `originator=codex-tui`，并接受 `source=cli` 或 `source=vscode`。新版 Codex 后台服务可能为终端会话写入 `vscode` 标记，`sess` 不会仅凭该标记排除会话；其他 originator 和子 Agent 记录仍不进入列表。
+
 列表按 `UPDATED` 从新到旧排列，并显示：
 
 | 列 | 内容 |
@@ -135,6 +137,8 @@ sess new <name> --fork <ID-or-name-or-prefix>
 不带 `--fork` 时，`sess new` 启动一个新的 Codex 会话；`name` 可以省略。带 `--fork` 时，它与 `sess fork` 使用同一套分叉流程：省略 `name` 会生成默认的 `<parent-prefix>-fork<N>` 名称，提供 `name` 则只使用该名称，并且不占用自动编号。
 
 Codex 在空白聊天界面中尚未写入 JSONL，因此 `sess` 会等到首次 prompt 产生 transcript 后再写入本地名称。命名一旦完成便不再等待原生会话退出，之后使用 Ctrl+C 不会丢失名称。未输入 prompt 就退出时，Codex 不会保存该 session，`sess` 也不会留下名称。
+
+如果已有当前目录的 Codex TUI 记录，但 `sess` 因未知 `source`、无效 session ID 等原因无法识别，退出时会明确报错并说明原因，不再静默跳过命名；原生记录保持不变。没有生成记录、其他项目或子 Agent 的新增记录不会因此被误报为命名失败。
 
 同一项目一次只允许一个尚未生成 transcript 的 `sess new` 或 `sess fork`。首个会话生成 JSONL 后，这项限制立即解除，即使该会话仍在运行，也可以从另一个终端再次启动。等待期间执行第二个相关命令会直接报错；同时直接启动原生 `codex` 或 `claude` 仍可能造成新会话识别歧义，因此应先让当前会话提交首次 prompt 或退出。
 

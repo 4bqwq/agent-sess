@@ -87,7 +87,9 @@ class CodexProvider(SessionProvider):
                 f"无法扫描 Codex 会话目录 "
                 f"{self.codex_home / 'sessions'}: {exc}"
             ) from exc
-        return self._discover_paths(transcript_paths, current_dir)
+        return self._discover_paths(
+            transcript_paths, current_dir, current_dir_warnings_only=True
+        )
 
     def _transcript_paths(self) -> tuple[Path, ...]:
         sessions_root = self.codex_home / "sessions"
@@ -96,19 +98,31 @@ class CodexProvider(SessionProvider):
         return tuple(sorted(sessions_root.rglob("*.jsonl")))
 
     def _discover_paths(
-        self, transcript_paths: Sequence[Path], current_dir: Path
+        self,
+        transcript_paths: Sequence[Path],
+        current_dir: Path,
+        *,
+        current_dir_warnings_only: bool = False,
     ) -> DiscoveryResult:
         sessions: list[Session] = []
         warnings: list[str] = []
         for transcript_path in transcript_paths:
-            session, file_warnings = self._read_transcript(transcript_path, current_dir)
+            session, file_warnings = self._read_transcript(
+                transcript_path,
+                current_dir,
+                current_dir_warnings_only=current_dir_warnings_only,
+            )
             warnings.extend(file_warnings)
             if session is not None:
                 sessions.append(session)
         return DiscoveryResult(tuple(sessions), tuple(warnings))
 
     def _read_transcript(
-        self, transcript_path: Path, target_cwd: Path
+        self,
+        transcript_path: Path,
+        target_cwd: Path,
+        *,
+        current_dir_warnings_only: bool = False,
     ) -> tuple[Session | None, list[str]]:
         warnings: list[str] = []
         session_id: str | None = None
@@ -116,6 +130,7 @@ class CodexProvider(SessionProvider):
         created_at = None
         updated_at = None
         matched = False
+        belongs_to_current_dir = False
         forked_from_id: str | None = None
 
         try:
@@ -148,17 +163,33 @@ class CodexProvider(SessionProvider):
                     payload = event.get("payload")
                     if not isinstance(payload, dict):
                         break
-                    if payload.get("originator") != "codex-tui" or payload.get("source") != "cli":
+                    if payload.get("originator") != "codex-tui":
+                        break
+                    source = payload.get("source")
+                    if source in ("exec", "subagent") or (
+                        isinstance(source, dict) and "subagent" in source
+                    ):
+                        break
+                    raw_cwd = payload.get("cwd")
+                    if not isinstance(raw_cwd, str):
+                        warnings.append(f"Codex session_meta 缺少 id 或 cwd: {transcript_path}")
+                        break
+                    belongs_to_current_dir = same_directory(raw_cwd, target_cwd)
+                    if source not in ("cli", "vscode"):
+                        if belongs_to_current_dir:
+                            warnings.append(
+                                f"Codex session_meta 包含不支持的 source {source!r}: "
+                                f"{transcript_path}"
+                            )
                         break
                     raw_id = payload.get("id")
-                    raw_cwd = payload.get("cwd")
-                    if not isinstance(raw_id, str) or not isinstance(raw_cwd, str):
+                    if not isinstance(raw_id, str):
                         warnings.append(f"Codex session_meta 缺少 id 或 cwd: {transcript_path}")
                         break
                     if not is_full_uuid(raw_id):
                         warnings.append(f"Codex session_meta 包含无效 session ID: {transcript_path}")
                         break
-                    if not same_directory(raw_cwd, target_cwd):
+                    if not belongs_to_current_dir:
                         break
                     if timestamp is None:
                         warnings.append(f"Codex session_meta 缺少有效 timestamp: {transcript_path}")
@@ -180,8 +211,12 @@ class CodexProvider(SessionProvider):
                     matched = True
         except (OSError, UnicodeError) as exc:
             warnings.append(f"无法读取 Codex transcript {transcript_path}: {exc}")
-            return None, warnings
+            matched = False
 
+        if current_dir_warnings_only and not belongs_to_current_dir:
+            # Other projects and subagents may create files during this launch.
+            # Their scan warnings are not evidence that this session failed.
+            warnings.clear()
         if not matched or session_id is None or cwd is None or created_at is None:
             return None, warnings
         if updated_at is None:

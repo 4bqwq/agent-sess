@@ -54,7 +54,8 @@ def make_trace_session(transcript: Path, cwd: Path) -> Session:
     )
 
 
-def test_discover_keeps_only_exact_interactive_cwd(tmp_path):
+@pytest.mark.parametrize("source", ["cli", "vscode"])
+def test_discover_keeps_only_exact_interactive_cwd(tmp_path, source):
     codex_home = tmp_path / "codex-home"
     current = tmp_path / "project"
     current.mkdir()
@@ -63,18 +64,18 @@ def test_discover_keeps_only_exact_interactive_cwd(tmp_path):
     write_jsonl(
         sessions / "interactive.jsonl",
         [
-            meta_event(current),
+            meta_event(current, source=source),
             {"timestamp": "2026-08-11T02:00:00Z", "type": "event_msg"},
         ],
         invalid_line=True,
     )
     write_jsonl(
         sessions / "exec.jsonl",
-        [meta_event(current, originator="codex-exec")],
+        [meta_event(current, originator="codex-exec", source=source)],
     )
     child = current / "child"
     child.mkdir()
-    write_jsonl(sessions / "child.jsonl", [meta_event(child)])
+    write_jsonl(sessions / "child.jsonl", [meta_event(child, source=source)])
 
     result = CodexProvider(codex_home=codex_home).discover(current)
 
@@ -83,7 +84,8 @@ def test_discover_keeps_only_exact_interactive_cwd(tmp_path):
     assert any("无效 JSON 行" in warning for warning in result.warnings)
 
 
-def test_discover_new_only_reads_paths_created_after_snapshot(tmp_path):
+@pytest.mark.parametrize("source", ["cli", "vscode"])
+def test_discover_new_only_reads_paths_created_after_snapshot(tmp_path, source):
     codex_home = tmp_path / "codex-home"
     current = tmp_path / "project"
     current.mkdir()
@@ -95,7 +97,7 @@ def test_discover_new_only_reads_paths_created_after_snapshot(tmp_path):
 
     write_jsonl(
         sessions / f"rollout-new-{FORKED_SESSION_ID}.jsonl",
-        [meta_event(current, session_id=FORKED_SESSION_ID)],
+        [meta_event(current, session_id=FORKED_SESSION_ID, source=source)],
     )
 
     result = provider.discover_new(current, snapshot)
@@ -105,7 +107,11 @@ def test_discover_new_only_reads_paths_created_after_snapshot(tmp_path):
     ]
 
 
-def test_discover_fork_keeps_child_identity_from_first_session_meta(tmp_path):
+@pytest.mark.parametrize("parent_source", ["cli", "vscode"])
+@pytest.mark.parametrize("child_source", ["cli", "vscode"])
+def test_discover_fork_keeps_child_identity_from_first_session_meta(
+    tmp_path, parent_source, child_source
+):
     codex_home = tmp_path / "codex-home"
     current = tmp_path / "project"
     current.mkdir()
@@ -117,6 +123,7 @@ def test_discover_fork_keeps_child_identity_from_first_session_meta(tmp_path):
             meta_event(
                 current,
                 timestamp="2026-08-03T13:27:51Z",
+                source=parent_source,
             ),
             {"timestamp": "2026-08-11T11:57:00Z", "type": "event_msg"},
         ],
@@ -125,6 +132,7 @@ def test_discover_fork_keeps_child_identity_from_first_session_meta(tmp_path):
         current,
         session_id=FORKED_SESSION_ID,
         timestamp="2026-08-11T12:26:46Z",
+        source=child_source,
     )
     child_meta["payload"]["forked_from_id"] = SESSION_ID
     write_jsonl(
@@ -134,6 +142,7 @@ def test_discover_fork_keeps_child_identity_from_first_session_meta(tmp_path):
             meta_event(
                 current,
                 timestamp="2026-08-11T12:26:46Z",
+                source=parent_source,
             ),
             {"timestamp": "2026-08-11T12:38:00Z", "type": "event_msg"},
         ],
@@ -155,6 +164,212 @@ def test_discover_fork_keeps_child_identity_from_first_session_meta(tmp_path):
     assert forked.updated_at.hour == 12
     assert forked.updated_at.minute == 38
     assert forked.forked_from_id == SESSION_ID
+
+
+@pytest.mark.parametrize("source", ["cli", "vscode"])
+@pytest.mark.parametrize("originator", ["codex-exec", "codex_vscode", "other-client"])
+def test_discover_excludes_non_tui_originators(tmp_path, source, originator):
+    codex_home = tmp_path / "codex-home"
+    current = tmp_path / "project"
+    current.mkdir()
+    transcript = codex_home / "sessions" / "excluded.jsonl"
+    write_jsonl(
+        transcript,
+        [
+            meta_event(current, originator=originator, source=source),
+            meta_event(current),
+        ],
+    )
+
+    result = CodexProvider(codex_home=codex_home).discover(current)
+
+    assert result.sessions == ()
+    assert result.warnings == ()
+
+
+def test_discover_excludes_missing_originator(tmp_path):
+    codex_home = tmp_path / "codex-home"
+    current = tmp_path / "project"
+    current.mkdir()
+    metadata = meta_event(current, source="vscode")
+    del metadata["payload"]["originator"]
+    write_jsonl(codex_home / "sessions" / "excluded.jsonl", [metadata])
+
+    result = CodexProvider(codex_home=codex_home).discover(current)
+
+    assert result.sessions == ()
+    assert result.warnings == ()
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "subagent",
+        "exec",
+        {
+            "subagent": {
+                "thread_spawn": {
+                    "parent_thread_id": SESSION_ID,
+                    "depth": 1,
+                }
+            }
+        },
+    ],
+)
+def test_discover_excludes_noninteractive_source_without_warning(tmp_path, source):
+    codex_home = tmp_path / "codex-home"
+    current = tmp_path / "project"
+    current.mkdir()
+    write_jsonl(
+        codex_home / "sessions" / "subagent.jsonl",
+        [
+            meta_event(current, session_id=FORKED_SESSION_ID, source=source),
+            meta_event(current),
+        ],
+    )
+
+    result = CodexProvider(codex_home=codex_home).discover(current)
+
+    assert result.sessions == ()
+    assert result.warnings == ()
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "other-cwd-invalid-id",
+        "other-cwd-invalid-json",
+        "subagent-invalid-json",
+        "exec-invalid-json",
+        "non-tui-invalid-json",
+        "unidentified-invalid-json",
+    ],
+)
+def test_discover_new_ignores_general_warnings_from_unrelated_transcripts(
+    tmp_path, case
+):
+    codex_home = tmp_path / "codex-home"
+    current = tmp_path / "project"
+    current.mkdir()
+    child = current / "child"
+    child.mkdir()
+    sessions = codex_home / "sessions"
+    write_jsonl(sessions / "existing.jsonl", [meta_event(current)])
+    provider = CodexProvider(codex_home=codex_home)
+    snapshot = provider.snapshot_transcript_paths()
+
+    metadata = meta_event(current)
+    invalid_json = case != "other-cwd-invalid-id"
+    if case.startswith("other-cwd"):
+        metadata["payload"]["cwd"] = str(child)
+    if case == "other-cwd-invalid-id":
+        metadata["payload"]["id"] = "invalid-session-id"
+    elif case == "subagent-invalid-json":
+        metadata["payload"]["source"] = {"subagent": "review"}
+    elif case == "exec-invalid-json":
+        metadata["payload"]["source"] = "exec"
+    elif case == "non-tui-invalid-json":
+        metadata["payload"]["originator"] = "codex-exec"
+    noise_events = [{}]
+    if case != "unidentified-invalid-json":
+        noise_events.append(metadata)
+    noise_transcript = sessions / "unrelated.jsonl"
+    write_jsonl(noise_transcript, noise_events, invalid_line=invalid_json)
+    write_jsonl(
+        sessions / "new.jsonl",
+        [meta_event(current, session_id=FORKED_SESSION_ID, source="vscode")],
+    )
+
+    discovered_new = provider.discover_new(current, snapshot)
+    discovered_all = provider.discover(current)
+
+    assert [session.session_id for session in discovered_new.sessions] == [
+        FORKED_SESSION_ID
+    ]
+    assert discovered_new.warnings == ()
+    assert {session.session_id for session in discovered_all.sessions} == {
+        SESSION_ID,
+        FORKED_SESSION_ID,
+    }
+    expected_warning = "无效 JSON 行" if invalid_json else "无效 session ID"
+    assert any(
+        expected_warning in warning and str(noise_transcript) in warning
+        for warning in discovered_all.warnings
+    )
+
+
+@pytest.mark.parametrize("source", ["cli", "vscode"])
+@pytest.mark.parametrize("case", ["invalid-json", "invalid-id"])
+def test_discover_new_keeps_general_warnings_from_current_tui_transcripts(
+    tmp_path, source, case
+):
+    codex_home = tmp_path / "codex-home"
+    current = tmp_path / "project"
+    current.mkdir()
+    provider = CodexProvider(codex_home=codex_home)
+    snapshot = provider.snapshot_transcript_paths()
+    metadata = meta_event(current, source=source)
+    if case == "invalid-id":
+        metadata["payload"]["id"] = "invalid-session-id"
+    transcript = codex_home / "sessions" / "new.jsonl"
+    write_jsonl(transcript, [{}, metadata], invalid_line=case == "invalid-json")
+
+    result = provider.discover_new(current, snapshot)
+
+    expected_ids = [SESSION_ID] if case == "invalid-json" else []
+    assert [session.session_id for session in result.sessions] == expected_ids
+    expected_warning = "无效 JSON 行" if case == "invalid-json" else "无效 session ID"
+    assert any(
+        expected_warning in warning and str(transcript) in warning
+        for warning in result.warnings
+    )
+
+
+@pytest.mark.parametrize("matching_cwd", [True, False])
+@pytest.mark.parametrize("discovery", ["discover", "discover_new"])
+@pytest.mark.parametrize(
+    ("source", "source_present"),
+    [
+        pytest.param("future-client", True, id="unknown-string"),
+        pytest.param("", True, id="empty-string"),
+        pytest.param(None, True, id="null"),
+        pytest.param(["vscode"], True, id="list"),
+        pytest.param({}, True, id="empty-object"),
+        pytest.param({"other": "cli"}, True, id="unknown-object"),
+        pytest.param(123, True, id="number"),
+        pytest.param(None, False, id="missing"),
+    ],
+)
+def test_discover_warns_for_unrecognized_tui_source_only_in_current_directory(
+    tmp_path, matching_cwd, discovery, source, source_present
+):
+    codex_home = tmp_path / "codex-home"
+    current = tmp_path / "project"
+    current.mkdir()
+    session_cwd = current if matching_cwd else current / "child"
+    if not matching_cwd:
+        session_cwd.mkdir()
+    metadata = meta_event(session_cwd, source=source)
+    if not source_present:
+        del metadata["payload"]["source"]
+    transcript = codex_home / "sessions" / "unknown-source.jsonl"
+    provider = CodexProvider(codex_home=codex_home)
+    snapshot = provider.snapshot_transcript_paths()
+    write_jsonl(transcript, [metadata, meta_event(current)])
+
+    if discovery == "discover_new":
+        result = provider.discover_new(current, snapshot)
+    else:
+        result = provider.discover(current)
+
+    assert result.sessions == ()
+    if matching_cwd:
+        assert any(
+            "source" in warning and str(transcript) in warning
+            for warning in result.warnings
+        )
+    else:
+        assert result.warnings == ()
 
 
 @pytest.fixture(params=["new", "resume", "fork"])

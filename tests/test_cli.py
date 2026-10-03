@@ -51,16 +51,25 @@ def make_codex_service(tmp_path):
     return service, runner
 
 
-def write_codex_session(service, session_id, *, forked_from_id=None):
+def write_codex_session(
+    service,
+    session_id,
+    *,
+    forked_from_id=None,
+    source="cli",
+    cwd=None,
+    originator="codex-tui",
+):
     provider = service.providers[Agent.CODEX]
     transcript = provider.codex_home / "sessions" / f"rollout-{session_id}.jsonl"
     transcript.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "id": session_id,
-        "cwd": str(service.project_dir),
-        "originator": "codex-tui",
-        "source": "cli",
+        "cwd": str(service.project_dir if cwd is None else cwd),
+        "originator": originator,
     }
+    if source is not None:
+        payload["source"] = source
     if forked_from_id is not None:
         payload["forked_from_id"] = forked_from_id
     transcript.write_text(
@@ -74,6 +83,7 @@ def write_codex_session(service, session_id, *, forked_from_id=None):
         + "\n",
         encoding="utf-8",
     )
+    return transcript
 
 
 def make_many_service(tmp_path, count=25):
@@ -137,11 +147,12 @@ def test_cli_resume_forwards_arguments(tmp_path):
         (["--full-auto"], []),
     ],
 )
+@pytest.mark.parametrize("source", ["cli", "vscode"])
 def test_cli_codex_resume_applies_only_missing_permission_defaults(
-    tmp_path, native_args, defaults
+    tmp_path, native_args, defaults, source
 ):
     service, runner = make_codex_service(tmp_path)
-    write_codex_session(service, CODEX_ID)
+    write_codex_session(service, CODEX_ID, source=source)
     forwarded = [*native_args, "--model", "test-model", "prompt"]
 
     assert run(["resume", CODEX_ID[:8], "--", *forwarded], service=service) == 0
@@ -150,9 +161,12 @@ def test_cli_codex_resume_applies_only_missing_permission_defaults(
     ]
 
 
-def test_cli_tui_selected_codex_session_uses_permission_defaults(tmp_path, monkeypatch):
+@pytest.mark.parametrize("source", ["cli", "vscode"])
+def test_cli_tui_selected_codex_session_uses_permission_defaults(
+    tmp_path, monkeypatch, source
+):
     service, runner = make_codex_service(tmp_path)
-    write_codex_session(service, CODEX_ID)
+    write_codex_session(service, CODEX_ID, source=source)
     monkeypatch.setattr(
         "sess.cli.SessionTui.run", lambda tui: tui.catalog.sessions[0]
     )
@@ -178,11 +192,12 @@ def test_cli_tui_selected_codex_session_uses_permission_defaults(tmp_path, monke
         (["-s", "workspace-write", "-a", "on-request"], []),
     ],
 )
+@pytest.mark.parametrize("source", ["cli", "vscode"])
 def test_cli_codex_new_and_fork_preserve_naming_with_permission_defaults(
-    tmp_path, capsys, arguments, forked, expected_name, native_args, defaults
+    tmp_path, capsys, arguments, forked, expected_name, native_args, defaults, source
 ):
     service, runner = make_codex_service(tmp_path)
-    write_codex_session(service, CODEX_ID)
+    write_codex_session(service, CODEX_ID, source=source)
     child_id = "791f0baf-9fb7-4d44-908a-c50b1a223a33"
     runner.return_code = 130
 
@@ -191,16 +206,170 @@ def test_cli_codex_new_and_fork_preserve_naming_with_permission_defaults(
             service,
             child_id,
             forked_from_id=CODEX_ID if forked else None,
+            source=source,
         )
 
     runner.on_run = create_session
+    observed_names = []
+    runner.after_observe = lambda observed: observed_names.append(
+        (observed, service.metadata.read_names())
+    )
     forwarded = [*native_args, "--model", "test-model", "prompt"]
 
     assert run([*arguments, "--", *forwarded], service=service) == 130
     command = ["codex", "fork", CODEX_ID] if forked else ["codex"]
     assert runner.calls == [[*command, *defaults, *forwarded]]
     assert service.metadata.read_names() == {f"codex:{child_id}": expected_name}
+    assert observed_names == [(True, {f"codex:{child_id}": expected_name})]
     assert f"codex:{child_id} -> {expected_name}" in capsys.readouterr().out
+
+
+def test_cli_ls_and_path_include_vscode_sessions(tmp_path, capsys):
+    service, runner = make_codex_service(tmp_path)
+    transcript = write_codex_session(service, CODEX_ID, source="vscode")
+
+    assert run(["ls"], service=service) == 0
+    listed = capsys.readouterr()
+    assert CODEX_ID in listed.out
+    assert not listed.err
+
+    assert run(["path", CODEX_ID[:8]], service=service) == 0
+    located = capsys.readouterr()
+    assert located.out == f"{transcript.resolve()}\n"
+    assert not located.err
+    assert not runner.calls
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["new"],
+        ["new", "experiment"],
+        ["fork", CODEX_ID],
+        ["new", "experiment", "--fork", CODEX_ID],
+    ],
+)
+@pytest.mark.parametrize("source", ["future-source", None, {}, [], 123])
+def test_cli_new_reports_an_unrecognized_current_project_source(
+    tmp_path, capsys, arguments, source
+):
+    service, runner = make_codex_service(tmp_path)
+    write_codex_session(service, CODEX_ID)
+    child_id = "791f0baf-9fb7-4d44-908a-c50b1a223a33"
+    created = []
+
+    def create_session(_argv):
+        forked = "--fork" in arguments or arguments[0] == "fork"
+        created.append(
+            write_codex_session(
+                service,
+                child_id,
+                source=source,
+                forked_from_id=CODEX_ID if forked else None,
+            )
+        )
+
+    runner.on_run = create_session
+    runner.return_code = 130
+
+    assert run(arguments, service=service) == 1
+    captured = capsys.readouterr()
+    assert not captured.out
+    assert "无法识别本次会话" in captured.err
+    if arguments != ["new"]:
+        assert "未完成命名" in captured.err
+    assert "source" in captured.err
+    assert str(created[0]) in captured.err
+    assert service.metadata.read_names() == {}
+
+
+def test_cli_named_new_reports_malformed_session_identity(tmp_path, capsys):
+    service, runner = make_codex_service(tmp_path)
+    runner.on_run = lambda _argv: write_codex_session(service, "invalid-session-id")
+
+    assert run(["new", "experiment"], service=service) == 1
+    captured = capsys.readouterr()
+    assert not captured.out
+    assert "本次会话" in captured.err
+    assert "session ID" in captured.err
+    assert "invalid-session-id" in captured.err
+    assert service.metadata.read_names() == {}
+
+
+@pytest.mark.parametrize(
+    "record", ["other-cwd-invalid-id", "invalid-json", "other-cwd-invalid-json"]
+)
+def test_cli_named_new_does_not_report_unidentifiable_unrelated_records(
+    tmp_path, capsys, record
+):
+    service, runner = make_codex_service(tmp_path)
+    runner.return_code = 130
+
+    def create_record(_argv):
+        session_id = (
+            "invalid-session-id"
+            if record == "other-cwd-invalid-id"
+            else "791f0baf-9fb7-4d44-908a-c50b1a223a33"
+        )
+        transcript = write_codex_session(
+            service, session_id, cwd=service.project_dir / "other"
+        )
+        if record == "invalid-json":
+            transcript.write_text("{invalid\n", encoding="utf-8")
+        elif record == "other-cwd-invalid-json":
+            with transcript.open("a", encoding="utf-8") as handle:
+                handle.write("{invalid\n")
+
+    runner.on_run = create_record
+
+    assert run(["new", "experiment"], service=service) == 130
+    captured = capsys.readouterr()
+    assert not captured.out
+    assert not captured.err
+    assert service.metadata.read_names() == {}
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["new", "experiment"],
+        ["fork", CODEX_ID],
+        ["new", "experiment", "--fork", CODEX_ID],
+    ],
+)
+@pytest.mark.parametrize(
+    "record",
+    ["none", "other-cwd", "exec", "subagent-dict", "subagent-string"],
+)
+def test_cli_launch_without_a_matching_interactive_record_does_not_report_failure(
+    tmp_path, capsys, arguments, record
+):
+    service, runner = make_codex_service(tmp_path)
+    write_codex_session(service, CODEX_ID)
+    child_id = "791f0baf-9fb7-4d44-908a-c50b1a223a33"
+    runner.return_code = 130
+
+    def create_record(_argv):
+        if record == "none":
+            return
+        options = {
+            "other-cwd": {
+                "cwd": service.project_dir / "other",
+                "source": "future-source",
+            },
+            "exec": {"source": "exec"},
+            "subagent-dict": {"source": {"subagent": {"thread_spawn": {}}}},
+            "subagent-string": {"source": "subagent"},
+        }
+        write_codex_session(service, child_id, **options[record])
+
+    runner.on_run = create_record
+
+    assert run(arguments, service=service) == 130
+    captured = capsys.readouterr()
+    assert not captured.out
+    assert not captured.err
+    assert service.metadata.read_names() == {}
 
 
 def test_cli_fork_reports_the_automatic_name(tmp_path, capsys, monkeypatch):

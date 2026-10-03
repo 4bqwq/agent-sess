@@ -290,7 +290,8 @@ def test_named_new_writes_name_before_native_process_returns(tmp_path):
     assert result.session.name == "experiment"
 
 
-def test_real_runner_names_new_session_before_child_exits(tmp_path, monkeypatch):
+@pytest.mark.parametrize("source", ["cli", "vscode"])
+def test_real_runner_names_new_session_before_child_exits(tmp_path, monkeypatch, source):
     project = tmp_path / "project"
     project.mkdir()
     codex_home = tmp_path / "codex-home"
@@ -332,7 +333,7 @@ transcript.write_text(
                 "id": sys.argv[3],
                 "cwd": sys.argv[2],
                 "originator": "codex-tui",
-                "source": "cli",
+                "source": sys.argv[5],
             },
         }
     )
@@ -355,6 +356,7 @@ raise SystemExit(0 if metadata.exists() else 9)
             str(project),
             new_id,
             str(metadata.path),
+            source,
         ],
     )
 
@@ -373,6 +375,52 @@ def test_named_new_without_a_persisted_session_leaves_no_name(tmp_path):
     assert result.name is None
     assert service.metadata.read_names() == {}
     assert runner.calls == [["codex"]]
+
+
+def test_named_new_reports_discovery_warnings_only_after_native_process_returns(
+    tmp_path, monkeypatch
+):
+    service, runner = make_service(tmp_path)
+    provider = service.providers[Agent.CODEX]
+    warning = "本次 transcript 包含无效 session ID: invalid-id.jsonl"
+    monkeypatch.setattr(
+        provider,
+        "discover_new",
+        lambda _project, _known_paths: DiscoveryResult(warnings=(warning,)),
+    )
+    observations = []
+    runner.after_observe = observations.append
+
+    with pytest.raises(ProviderError, match="本次会话") as error:
+        service.new("experiment")
+
+    assert observations == [False]
+    assert warning in str(error.value)
+    assert service.metadata.read_names() == {}
+
+
+def test_named_new_can_bind_a_session_when_discovery_also_has_warnings(
+    tmp_path, monkeypatch
+):
+    service, runner = make_service(tmp_path)
+    provider = service.providers[Agent.CODEX]
+    new_id = "791f0baf-9fb7-4d44-908a-c50b1a223a33"
+    created = make_session(Agent.CODEX, new_id, tmp_path, 3)
+    monkeypatch.setattr(
+        provider,
+        "discover_new",
+        lambda _project, _known_paths: DiscoveryResult(
+            (created,), ("trailing incomplete JSON line",)
+        ),
+    )
+    runner.return_code = 130
+
+    result = service.new("experiment")
+
+    assert result.return_code == 130
+    assert result.session is not None
+    assert result.session.session_id == new_id
+    assert service.metadata.read_names() == {f"codex:{new_id}": "experiment"}
 
 
 def test_named_new_refuses_to_guess_between_multiple_new_sessions(tmp_path):
