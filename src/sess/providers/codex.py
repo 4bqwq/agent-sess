@@ -200,13 +200,97 @@ class CodexProvider(SessionProvider):
         )
 
     def resume_argv(self, session_id: str, native_args: Sequence[str]) -> list[str]:
-        return [self.executable, "resume", session_id, *native_args]
+        return [
+            self.executable,
+            "resume",
+            session_id,
+            *self._permission_defaults(native_args),
+            *native_args,
+        ]
 
     def new_argv(self, native_args: Sequence[str]) -> list[str]:
-        return [self.executable, *native_args]
+        return [self.executable, *self._permission_defaults(native_args), *native_args]
 
     def fork_argv(self, session_id: str, native_args: Sequence[str]) -> list[str]:
-        return [self.executable, "fork", session_id, *native_args]
+        return [
+            self.executable,
+            "fork",
+            session_id,
+            *self._permission_defaults(native_args),
+            *native_args,
+        ]
+
+    @staticmethod
+    def _permission_defaults(native_args: Sequence[str]) -> list[str]:
+        sandbox_overridden = False
+        approval_overridden = False
+        arguments = iter(native_args)
+        for argument in arguments:
+            if argument == "--":
+                break
+            if argument in {
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--yolo",
+                "--full-auto",
+                "--approve-for-me",
+            }:
+                # These native shortcuts select both permission settings.
+                return []
+            if argument in {"--sandbox", "-s"}:
+                sandbox_overridden = True
+                next(arguments, None)
+            elif argument.startswith("--sandbox=") or (
+                argument.startswith("-s") and not argument.startswith("--")
+            ):
+                sandbox_overridden = True
+            elif argument in {"--ask-for-approval", "-a"}:
+                approval_overridden = True
+                next(arguments, None)
+            elif argument.startswith("--ask-for-approval=") or (
+                argument.startswith("-a") and not argument.startswith("--")
+            ):
+                approval_overridden = True
+            elif argument in {"-c", "--config"} or argument.startswith(
+                ("--config=", "-c")
+            ):
+                if argument in {"-c", "--config"}:
+                    override = next(arguments, "")
+                elif argument.startswith("--config="):
+                    override = argument[len("--config=") :]
+                else:
+                    override = argument[2:].removeprefix("=")
+                key, separator, _ = override.partition("=")
+                if separator:
+                    key = key.strip()
+                    sandbox_overridden |= key == "sandbox_mode"
+                    approval_overridden |= (
+                        key == "approval_policy" or key.startswith("approval_policy.")
+                    )
+            elif argument in {
+                "-m",
+                "--model",
+                "-p",
+                "--profile",
+                "-i",
+                "--image",
+                "-C",
+                "--cd",
+                "--add-dir",
+                "--local-provider",
+                "--enable",
+                "--disable",
+                "--remote",
+                "--remote-auth-token-env",
+            }:
+                # An option's value is not another permission option.
+                next(arguments, None)
+
+        defaults: list[str] = []
+        if not sandbox_overridden:
+            defaults.extend(("--sandbox", "danger-full-access"))
+        if not approval_overridden:
+            defaults.extend(("--ask-for-approval", "never"))
+        return defaults
 
     def read_trace(self, session: Session, all_turns: bool) -> SessionTrace:
         if session.agent is not self.agent:

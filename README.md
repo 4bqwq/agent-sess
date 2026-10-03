@@ -110,6 +110,19 @@ Markdown 只写入标准输出。读取活跃会话时，`sess print` 会对命�
 
 `print` 保留详细执行轨迹；只需要人工查看最终问答时使用 `show`，需要原生完整记录时使用 `path` 获取 JSONL 文件。
 
+## Codex 启动权限
+
+`sess new`、`sess resume`、`sess fork`、`sess new --fork`，以及在交互列表中恢复 Codex 会话时，默认使用 `--sandbox danger-full-access --ask-for-approval never`：允许完整访问，不请求执行审批。
+
+默认值只影响本次由 `sess` 启动的 Codex，不修改全局 Codex 配置，不影响直接执行 `codex` 或 Claude Code。需要本次使用其他权限时，在 `--` 后明确指定：
+
+```bash
+sess new experiment -- --sandbox workspace-write --ask-for-approval on-request
+sess resume <ID-or-name-or-prefix> -- -s read-only -a on-request
+```
+
+只指定一项时，另一项仍使用上述默认值。`-c sandbox_mode=...`、`-c approval_policy=...` 也会覆盖对应默认值；显式指定原生权限组合开关时，权限由该开关决定。用户传入的参数仍保持原内容和顺序，`sess` 不会额外添加与这些设置冲突的默认参数。
+
 ## 启动新会话
 
 ```bash
@@ -177,7 +190,7 @@ sess resume <ID-or-name-or-prefix> -- \
   -c 'model_providers.<provider>.env_key="CODEX_CUSTOM_API_KEY"'
 ```
 
-`sess` 只会在原生命令中插入已经解析出的 session ID。`--` 后的参数会保持内容和顺序并全部交给 Codex 或 Claude Code，包括原生 CLI 自己用于选择会话的参数；如果这些参数与 `sess` 插入的 ID 冲突，由原生 CLI 决定结果并报告错误。
+恢复或分叉时，`sess` 会在原生命令中插入已经解析出的 session ID，并为 Codex 补上未被显式覆盖的默认权限参数。`--` 后的参数会保持内容和顺序并全部交给 Codex 或 Claude Code，包括原生 CLI 自己用于选择会话的参数；如果这些参数与 `sess` 插入的 ID 冲突，由原生 CLI 决定结果并报告错误。
 
 更换模型或 Provider 后能否继续某个历史会话，由当前版本的 Codex 或 Claude Code 决定。原生 CLI 返回错误时，`sess` 会保留原始退出码，不转换 transcript，也不尝试备用 Provider。
 

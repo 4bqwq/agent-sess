@@ -290,7 +290,7 @@ def test_named_new_writes_name_before_native_process_returns(tmp_path):
     assert result.session.name == "experiment"
 
 
-def test_real_runner_names_new_session_before_child_exits(tmp_path):
+def test_real_runner_names_new_session_before_child_exits(tmp_path, monkeypatch):
     project = tmp_path / "project"
     project.mkdir()
     codex_home = tmp_path / "codex-home"
@@ -305,6 +305,10 @@ def test_real_runner_names_new_session_before_child_exits(tmp_path):
     )
     metadata = MetadataStore(project)
     provider = CodexProvider(codex_home=codex_home, executable=sys.executable)
+    # This child tests live transcript observation, not Codex CLI argument parsing.
+    monkeypatch.setattr(
+        provider, "new_argv", lambda native_args: [sys.executable, *native_args]
+    )
     service = SessionService(
         project,
         (provider,),

@@ -157,21 +157,206 @@ def test_discover_fork_keeps_child_identity_from_first_session_meta(tmp_path):
     assert forked.forked_from_id == SESSION_ID
 
 
-def test_codex_commands_preserve_forwarded_argument_order():
+@pytest.fixture(params=["new", "resume", "fork"])
+def codex_launch(request):
     provider = CodexProvider(codex_home=Path("/unused"), executable="codex-test")
+    command = request.param
+    prefix = ["codex-test"]
+    if command != "new":
+        prefix.extend([command, SESSION_ID])
+
+    def launch(native_args):
+        if command == "new":
+            return provider.new_argv(native_args)
+        return getattr(provider, f"{command}_argv")(SESSION_ID, native_args)
+
+    return launch, prefix
+
+
+def test_codex_commands_default_to_full_access_without_approval(codex_launch):
+    launch, prefix = codex_launch
+
+    assert launch([]) == [
+        *prefix,
+        "--sandbox",
+        "danger-full-access",
+        "--ask-for-approval",
+        "never",
+    ]
+
+
+def test_codex_commands_preserve_forwarded_argument_order(codex_launch):
+    launch, prefix = codex_launch
     native_args = ["-c", 'model="gpt-test"', "--model", "gpt-test", "prompt"]
 
-    assert provider.new_argv(native_args) == ["codex-test", *native_args]
-    assert provider.resume_argv(SESSION_ID, native_args) == [
-        "codex-test",
-        "resume",
-        SESSION_ID,
+    assert launch(native_args) == [
+        *prefix,
+        "--sandbox",
+        "danger-full-access",
+        "--ask-for-approval",
+        "never",
         *native_args,
     ]
-    assert provider.fork_argv(SESSION_ID, native_args) == [
-        "codex-test",
-        "fork",
-        SESSION_ID,
+
+
+@pytest.mark.parametrize(
+    "native_args",
+    [
+        ["--sandbox", "workspace-write"],
+        ["--sandbox=workspace-write"],
+        ["-s", "read-only"],
+        ["-sread-only"],
+        ["-s=read-only"],
+    ],
+)
+def test_codex_explicit_sandbox_only_overrides_sandbox_default(
+    codex_launch, native_args
+):
+    launch, prefix = codex_launch
+
+    assert launch(native_args) == [
+        *prefix,
+        "--ask-for-approval",
+        "never",
+        *native_args,
+    ]
+
+
+@pytest.mark.parametrize(
+    "native_args",
+    [
+        ["--ask-for-approval", "on-request"],
+        ["--ask-for-approval=on-request"],
+        ["-a", "on-request"],
+        ["-aon-request"],
+        ["-a=on-request"],
+    ],
+)
+def test_codex_explicit_approval_only_overrides_approval_default(
+    codex_launch, native_args
+):
+    launch, prefix = codex_launch
+
+    assert launch(native_args) == [
+        *prefix,
+        "--sandbox",
+        "danger-full-access",
+        *native_args,
+    ]
+
+
+@pytest.mark.parametrize(
+    "native_args",
+    [
+        ["--sandbox", "read-only", "--ask-for-approval", "on-request"],
+        ["-aon-request", "--model", "gpt-test", "-s=workspace-write", "prompt"],
+        ["--sandbox=workspace-write", "--ask-for-approval=on-request"],
+    ],
+)
+def test_codex_explicit_permissions_override_both_defaults(
+    codex_launch, native_args
+):
+    launch, prefix = codex_launch
+
+    assert launch(native_args) == [*prefix, *native_args]
+
+
+@pytest.mark.parametrize(
+    ("native_args", "remaining_defaults"),
+    [
+        (["-c", 'sandbox_mode="workspace-write"'], ["--ask-for-approval", "never"]),
+        (["--config", 'sandbox_mode="read-only"'], ["--ask-for-approval", "never"]),
+        (["--config=sandbox_mode=workspace-write"], ["--ask-for-approval", "never"]),
+        (["-csandbox_mode=read-only"], ["--ask-for-approval", "never"]),
+        (["-c=sandbox_mode=read-only"], ["--ask-for-approval", "never"]),
+        (["-c", ' sandbox_mode = "read-only" '], ["--ask-for-approval", "never"]),
+        (["-c", 'approval_policy="on-request"'], ["--sandbox", "danger-full-access"]),
+        (["--config=approval_policy=on-request"], ["--sandbox", "danger-full-access"]),
+        (["-capproval_policy=on-request"], ["--sandbox", "danger-full-access"]),
+        (["-c", ' approval_policy = "on-request" '], ["--sandbox", "danger-full-access"]),
+        (
+            ["-c", "approval_policy.granular.sandbox_approval=true"],
+            ["--sandbox", "danger-full-access"],
+        ),
+        (
+            ["-c", "sandbox_mode=read-only", "--config", "approval_policy=on-request"],
+            [],
+        ),
+    ],
+)
+def test_codex_permission_config_overrides_matching_defaults(
+    codex_launch, native_args, remaining_defaults
+):
+    launch, prefix = codex_launch
+
+    assert launch(native_args) == [*prefix, *remaining_defaults, *native_args]
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--yolo",
+        "--approve-for-me",
+        "--full-auto",
+    ],
+)
+def test_codex_combined_permission_flags_override_both_defaults(codex_launch, flag):
+    launch, prefix = codex_launch
+    native_args = ["--model", "gpt-test", flag, "prompt"]
+
+    assert launch(native_args) == [*prefix, *native_args]
+
+
+@pytest.mark.parametrize(
+    "native_args",
+    [
+        ["--", "--sandbox", "read-only", "--ask-for-approval", "on-request"],
+        ["--", "--yolo"],
+        ["--", "--approve-for-me"],
+        ["--", "-c", "sandbox_mode=read-only"],
+        ["Explain --sandbox and --ask-for-approval"],
+        ["--model", "--sandbox"],
+        ["-m", "--ask-for-approval"],
+        ["--profile", "--full-auto"],
+        ["-p", "--yolo"],
+        ["--image", "--ask-for-approval"],
+        ["--add-dir", "--yolo"],
+        ["--enable", "--sandbox"],
+        ["--disable", "--ask-for-approval"],
+        ["-C", "--full-auto"],
+        ["--remote", "--yolo"],
+        ["--remote-auth-token-env", "--approve-for-me"],
+        ["-c", 'model="--sandbox"'],
+        ["--config", 'other="--ask-for-approval"'],
+        ["--config=other=--yolo"],
+        ["-c", 'sandbox_permissions=["disk-full-read-access"]'],
+        ["-c", "profiles.work.sandbox_mode=read-only"],
+    ],
+)
+def test_codex_permission_like_values_and_prompts_do_not_override_defaults(
+    codex_launch, native_args
+):
+    launch, prefix = codex_launch
+
+    assert launch(native_args) == [
+        *prefix,
+        "--sandbox",
+        "danger-full-access",
+        "--ask-for-approval",
+        "never",
+        *native_args,
+    ]
+
+
+def test_codex_only_options_before_native_terminator_override_defaults(codex_launch):
+    launch, prefix = codex_launch
+    native_args = ["--sandbox=read-only", "--", "--ask-for-approval=on-request"]
+
+    assert launch(native_args) == [
+        *prefix,
+        "--ask-for-approval",
+        "never",
         *native_args,
     ]
 

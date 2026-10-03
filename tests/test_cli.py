@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from sess.cli import run, split_native_args
@@ -13,6 +15,7 @@ from sess.models import (
     TraceEvent,
     TraceEventKind,
 )
+from sess.providers.codex import CodexProvider
 from sess.service import SessionService
 
 from test_service import (
@@ -24,6 +27,53 @@ from test_service import (
     make_service,
     make_session,
 )
+
+
+CODEX_PERMISSION_DEFAULTS = [
+    "--sandbox",
+    "danger-full-access",
+    "--ask-for-approval",
+    "never",
+]
+
+
+def make_codex_service(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    provider = CodexProvider(codex_home=tmp_path / "codex-home")
+    runner = CapturingRunner()
+    service = SessionService(
+        project,
+        (provider,),
+        MetadataStore(project),
+        runner,
+    )
+    return service, runner
+
+
+def write_codex_session(service, session_id, *, forked_from_id=None):
+    provider = service.providers[Agent.CODEX]
+    transcript = provider.codex_home / "sessions" / f"rollout-{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "id": session_id,
+        "cwd": str(service.project_dir),
+        "originator": "codex-tui",
+        "source": "cli",
+    }
+    if forked_from_id is not None:
+        payload["forked_from_id"] = forked_from_id
+    transcript.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-08-11T00:00:00Z",
+                "type": "session_meta",
+                "payload": payload,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def make_many_service(tmp_path, count=25):
@@ -71,6 +121,86 @@ def test_cli_resume_forwards_arguments(tmp_path):
         "model=x",
         "prompt",
     ]
+
+
+@pytest.mark.parametrize(
+    ("native_args", "defaults"),
+    [
+        ([], CODEX_PERMISSION_DEFAULTS),
+        (
+            ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"],
+            [],
+        ),
+        (["--sandbox", "read-only"], ["--ask-for-approval", "never"]),
+        (["-a", "on-request"], ["--sandbox", "danger-full-access"]),
+        (["-c", 'sandbox_mode="workspace-write"'], ["--ask-for-approval", "never"]),
+        (["--full-auto"], []),
+    ],
+)
+def test_cli_codex_resume_applies_only_missing_permission_defaults(
+    tmp_path, native_args, defaults
+):
+    service, runner = make_codex_service(tmp_path)
+    write_codex_session(service, CODEX_ID)
+    forwarded = [*native_args, "--model", "test-model", "prompt"]
+
+    assert run(["resume", CODEX_ID[:8], "--", *forwarded], service=service) == 0
+    assert runner.calls == [
+        ["codex", "resume", CODEX_ID, *defaults, *forwarded]
+    ]
+
+
+def test_cli_tui_selected_codex_session_uses_permission_defaults(tmp_path, monkeypatch):
+    service, runner = make_codex_service(tmp_path)
+    write_codex_session(service, CODEX_ID)
+    monkeypatch.setattr(
+        "sess.cli.SessionTui.run", lambda tui: tui.catalog.sessions[0]
+    )
+
+    assert run([], service=service) == 0
+    assert runner.calls == [
+        ["codex", "resume", CODEX_ID, *CODEX_PERMISSION_DEFAULTS]
+    ]
+
+
+@pytest.mark.parametrize(
+    ("arguments", "forked", "expected_name"),
+    [
+        (["new", "experiment"], False, "experiment"),
+        (["fork", CODEX_ID[:8]], True, "019fec4f-fork1"),
+        (["new", "experiment", "--fork", CODEX_ID[:8]], True, "experiment"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("native_args", "defaults"),
+    [
+        ([], CODEX_PERMISSION_DEFAULTS),
+        (["-s", "workspace-write", "-a", "on-request"], []),
+    ],
+)
+def test_cli_codex_new_and_fork_preserve_naming_with_permission_defaults(
+    tmp_path, capsys, arguments, forked, expected_name, native_args, defaults
+):
+    service, runner = make_codex_service(tmp_path)
+    write_codex_session(service, CODEX_ID)
+    child_id = "791f0baf-9fb7-4d44-908a-c50b1a223a33"
+    runner.return_code = 130
+
+    def create_session(_argv):
+        write_codex_session(
+            service,
+            child_id,
+            forked_from_id=CODEX_ID if forked else None,
+        )
+
+    runner.on_run = create_session
+    forwarded = [*native_args, "--model", "test-model", "prompt"]
+
+    assert run([*arguments, "--", *forwarded], service=service) == 130
+    command = ["codex", "fork", CODEX_ID] if forked else ["codex"]
+    assert runner.calls == [[*command, *defaults, *forwarded]]
+    assert service.metadata.read_names() == {f"codex:{child_id}": expected_name}
+    assert f"codex:{child_id} -> {expected_name}" in capsys.readouterr().out
 
 
 def test_cli_fork_reports_the_automatic_name(tmp_path, capsys, monkeypatch):
