@@ -16,7 +16,7 @@ from sess.models import (
     SessionLaunch,
     SessionTrace,
 )
-from sess.paths import same_directory
+from sess.paths import directory_scan_cache, same_directory
 from sess.process import NativeProcessRunner, ProjectLaunchLock
 from sess.providers import ClaudeProvider, CodexProvider
 from sess.providers.base import SessionProvider
@@ -44,28 +44,29 @@ class SessionService:
         self.runner = runner or NativeProcessRunner()
 
     def catalog(self) -> Catalog:
-        sessions: list[Session] = []
-        warnings: list[str] = []
-        for provider in self.providers.values():
-            try:
-                result = provider.discover(self.project_dir)
-            except (OSError, ProviderError) as exc:
-                warnings.append(f"{provider.agent.value}: {exc}")
-                continue
-            sessions.extend(
-                session
-                for session in result.sessions
-                if same_directory(session.cwd, self.project_dir)
-            )
-            warnings.extend(result.warnings)
+        with directory_scan_cache():
+            sessions: list[Session] = []
+            warnings: list[str] = []
+            for provider in self.providers.values():
+                try:
+                    result = provider.discover(self.project_dir)
+                except (OSError, ProviderError) as exc:
+                    warnings.append(f"{provider.agent.value}: {exc}")
+                    continue
+                sessions.extend(
+                    session
+                    for session in result.sessions
+                    if same_directory(session.cwd, self.project_dir)
+                )
+                warnings.extend(result.warnings)
 
-        names = self.metadata.read_names()
-        named_sessions = [session.with_name(names.get(session.metadata_key)) for session in sessions]
-        named_sessions.sort(
-            key=lambda session: (session.updated_at, session.created_at, session.session_id),
-            reverse=True,
-        )
-        return Catalog(tuple(named_sessions), tuple(warnings))
+            names = self.metadata.read_names()
+            named_sessions = [session.with_name(names.get(session.metadata_key)) for session in sessions]
+            named_sessions.sort(
+                key=lambda session: (session.updated_at, session.created_at, session.session_id),
+                reverse=True,
+            )
+            return Catalog(tuple(named_sessions), tuple(warnings))
 
     def resolve(self, target: str, catalog: Catalog | None = None) -> Session:
         selected_catalog = catalog or self.catalog()

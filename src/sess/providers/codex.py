@@ -26,6 +26,7 @@ from sess.providers.common import (
     format_tool_input,
     is_full_uuid,
     iter_jsonl_snapshot,
+    iter_jsonl_snapshot_reverse,
     parse_timestamp,
 )
 
@@ -134,32 +135,50 @@ class CodexProvider(SessionProvider):
         forked_from_id: str | None = None
 
         try:
-            with transcript_path.open("r", encoding="utf-8") as handle:
-                for line_number, line in enumerate(handle, start=1):
+            with transcript_path.open("rb") as handle:
+                snapshot_size = os.fstat(handle.fileno()).st_size
+                remaining = snapshot_size
+                line_number = 0
+                while remaining > 0:
+                    raw_line = handle.readline(remaining)
+                    if not raw_line:
+                        raise ProviderError(
+                            f"Codex transcript 在读取快照时被截断: {transcript_path}"
+                        )
+                    remaining -= len(raw_line)
+                    line_number += 1
+                    try:
+                        line = raw_line.decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        warnings.append(
+                            "跳过 Codex transcript 的无效 UTF-8 行 "
+                            f"{transcript_path}:{line_number}: {exc}"
+                        )
+                        continue
                     if not line.strip():
                         continue
                     try:
                         event = json.loads(line)
                     except json.JSONDecodeError as exc:
-                        warnings.append(
-                            f"跳过 Codex transcript 的无效 JSON 行 "
-                            f"{transcript_path}:{line_number}: {exc.msg}"
-                        )
+                        if remaining == 0 and not raw_line.endswith(b"\n"):
+                            warnings.append(
+                                "忽略 Codex transcript 尚未完整写入的末行 "
+                                f"{transcript_path}:{line_number}"
+                            )
+                        else:
+                            warnings.append(
+                                f"跳过 Codex transcript 的无效 JSON 行 "
+                                f"{transcript_path}:{line_number}: {exc.msg}"
+                            )
                         continue
                     if not isinstance(event, dict):
                         continue
 
-                    timestamp = parse_timestamp(event.get("timestamp"))
-                    if timestamp is not None and (updated_at is None or timestamp > updated_at):
-                        updated_at = timestamp
-
                     if event.get("type") != "session_meta":
                         continue
-                    if matched:
-                        # Fork rollouts copy the parent transcript after the
-                        # child's own metadata. Those copied records must not
-                        # replace the identity of the rollout being scanned.
-                        continue
+                    # Only the first metadata owns this rollout's identity.
+                    # A fork's body can contain copied parent metadata.
+                    timestamp = parse_timestamp(event.get("timestamp"))
                     payload = event.get("payload")
                     if not isinstance(payload, dict):
                         break
@@ -209,7 +228,18 @@ class CodexProvider(SessionProvider):
                                 f"{transcript_path}"
                             )
                     matched = True
-        except (OSError, UnicodeError) as exc:
+                    break
+
+                if matched:
+                    updated_at = created_at
+                    for event in iter_jsonl_snapshot_reverse(
+                        handle, snapshot_size, warnings, "Codex", transcript_path
+                    ):
+                        timestamp = parse_timestamp(event.get("timestamp"))
+                        if timestamp is not None:
+                            updated_at = max(created_at, timestamp)
+                            break
+        except (OSError, UnicodeError, ProviderError) as exc:
             warnings.append(f"无法读取 Codex transcript {transcript_path}: {exc}")
             matched = False
 
@@ -219,8 +249,6 @@ class CodexProvider(SessionProvider):
             warnings.clear()
         if not matched or session_id is None or cwd is None or created_at is None:
             return None, warnings
-        if updated_at is None:
-            updated_at = created_at
         return (
             Session(
                 agent=self.agent,

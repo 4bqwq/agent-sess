@@ -6,6 +6,7 @@ import uuid
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import BinaryIO
 
 from sess.errors import ProviderError
 
@@ -78,6 +79,84 @@ def iter_jsonl_snapshot(
                     yield value
     except OSError as exc:
         raise ProviderError(f"无法读取 {provider_label} transcript {path}: {exc}") from exc
+
+
+def iter_jsonl_snapshot_reverse(
+    handle: BinaryIO,
+    snapshot_size: int,
+    warnings: list[str],
+    provider_label: str,
+    path: Path,
+) -> Iterator[dict[str, object]]:
+    """Read complete JSONL records backwards within an open file's snapshot."""
+
+    def parse_line(
+        raw_line: bytes, byte_offset: int, line_end: int
+    ) -> dict[str, object] | None:
+        location = f"{path}（字节偏移 {byte_offset}）"
+        try:
+            line = raw_line.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            warnings.append(
+                f"跳过 {provider_label} transcript 的无效 UTF-8 行 {location}: {exc}"
+            )
+            return None
+        if not line.strip():
+            return None
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError as exc:
+            if line_end == snapshot_size and not ends_with_newline:
+                warnings.append(
+                    f"忽略 {provider_label} transcript 尚未完整写入的末行 {location}"
+                )
+            else:
+                warnings.append(
+                    f"跳过 {provider_label} transcript 的无效 JSON 行 "
+                    f"{location}: {exc.msg}"
+                )
+            return None
+        return value if isinstance(value, dict) else None
+
+    position = snapshot_size
+    line_end = snapshot_size
+    ends_with_newline = False
+    pending_fragments: list[bytes] = []
+    while position > 0:
+        start = max(0, position - 8 * 1024)
+        handle.seek(start)
+        block = handle.read(position - start)
+        if len(block) != position - start:
+            raise ProviderError(
+                f"{provider_label} transcript 在逆向读取快照时被截断或读取不完整: "
+                f"{path}（字节偏移 {start}，期望 {position - start} 字节，"
+                f"实际 {len(block)} 字节）"
+            )
+        if position == snapshot_size:
+            ends_with_newline = block.endswith(b"\n")
+
+        fragments = block.split(b"\n")
+        cursor = position
+        for index in range(len(fragments) - 1, 0, -1):
+            fragment = fragments[index]
+            cursor -= len(fragment)
+            if fragment:
+                pending_fragments.append(fragment)
+            raw_line = b"".join(reversed(pending_fragments))
+            pending_fragments.clear()
+            value = parse_line(raw_line, cursor, line_end)
+            if value is not None:
+                yield value
+            cursor -= 1
+            line_end = cursor
+        if fragments[0]:
+            pending_fragments.append(fragments[0])
+        position = start
+
+    if pending_fragments:
+        value = parse_line(b"".join(reversed(pending_fragments)), 0, line_end)
+        if value is not None:
+            yield value
 
 
 def format_tool_input(value: object) -> tuple[str, str]:

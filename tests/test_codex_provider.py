@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import sess.providers.codex as codex_module
 from sess.models import Agent, Session, TraceEventKind
 from sess.providers.codex import CodexProvider
 
@@ -54,6 +55,16 @@ def make_trace_session(transcript: Path, cwd: Path) -> Session:
     )
 
 
+@pytest.fixture
+def codex_summary_file(tmp_path):
+    current = tmp_path / "project"
+    current.mkdir()
+    codex_home = tmp_path / "codex-home"
+    transcript = codex_home / "sessions" / "summary.jsonl"
+    transcript.parent.mkdir(parents=True)
+    return CodexProvider(codex_home=codex_home), current, transcript
+
+
 @pytest.mark.parametrize("source", ["cli", "vscode"])
 def test_discover_keeps_only_exact_interactive_cwd(tmp_path, source):
     codex_home = tmp_path / "codex-home"
@@ -81,7 +92,368 @@ def test_discover_keeps_only_exact_interactive_cwd(tmp_path, source):
 
     assert [session.session_id for session in result.sessions] == [SESSION_ID]
     assert result.sessions[0].updated_at.hour == 2
+    assert result.warnings == ()
+
+
+def test_discover_reads_until_first_session_meta_and_warns_for_bad_prefix(
+    codex_summary_file,
+):
+    provider, current, transcript = codex_summary_file
+    write_jsonl(
+        transcript,
+        [
+            {},
+            [],
+            {"timestamp": "2026-08-11T23:00:00Z", "type": "event_msg"},
+            meta_event(current),
+            {"timestamp": "2026-08-11T02:00:00Z", "type": "event_msg"},
+        ],
+        invalid_line=True,
+    )
+
+    result = provider.discover(current)
+
+    assert [session.session_id for session in result.sessions] == [SESSION_ID]
+    assert result.sessions[0].created_at.hour == 0
+    assert result.sessions[0].updated_at.hour == 2
     assert any("无效 JSON 行" in warning for warning in result.warnings)
+
+
+def test_discover_skips_invalid_utf8_before_first_session_meta(codex_summary_file):
+    provider, current, transcript = codex_summary_file
+    transcript.write_bytes(
+        b"\xff\n" + json.dumps(meta_event(current)).encode("utf-8") + b"\n"
+    )
+
+    result = provider.discover(current)
+
+    assert [session.session_id for session in result.sessions] == [SESSION_ID]
+    assert result.sessions[0].updated_at == result.sessions[0].created_at
+    assert any("无效 UTF-8" in warning for warning in result.warnings)
+
+
+@pytest.mark.parametrize(
+    ("case", "warning"),
+    [
+        ("foreign-cwd", None),
+        ("missing-id", "缺少 id 或 cwd"),
+        ("invalid-id", "无效 session ID"),
+        ("invalid-timestamp", "缺少有效 timestamp"),
+        ("invalid-payload", None),
+    ],
+)
+def test_discover_does_not_borrow_identity_from_a_later_session_meta(
+    codex_summary_file, case, warning
+):
+    provider, current, transcript = codex_summary_file
+    first_meta = meta_event(current, session_id=FORKED_SESSION_ID)
+    if case == "foreign-cwd":
+        first_meta["payload"]["cwd"] = str(current / "child")
+    elif case == "missing-id":
+        del first_meta["payload"]["id"]
+    elif case == "invalid-id":
+        first_meta["payload"]["id"] = "not-a-session-id"
+    elif case == "invalid-timestamp":
+        first_meta["timestamp"] = "not-a-timestamp"
+    elif case == "invalid-payload":
+        first_meta["payload"] = []
+    write_jsonl(transcript, [first_meta, meta_event(current)])
+
+    result = provider.discover(current)
+
+    assert result.sessions == ()
+    if warning is None:
+        assert result.warnings == ()
+    else:
+        assert any(warning in item for item in result.warnings)
+
+
+def test_discover_updated_uses_last_valid_timestamp_not_full_file_maximum(
+    codex_summary_file,
+):
+    provider, current, transcript = codex_summary_file
+    write_jsonl(
+        transcript,
+        [
+            meta_event(current),
+            {"timestamp": "2026-08-11T23:00:00Z", "type": "event_msg"},
+            {"timestamp": "2026-08-11T02:00:00Z", "type": "event_msg"},
+        ],
+    )
+
+    result = provider.discover(current)
+
+    assert result.sessions[0].updated_at.hour == 2
+    assert result.warnings == ()
+
+
+def test_discover_fork_updated_never_predates_child_creation(codex_summary_file):
+    provider, current, transcript = codex_summary_file
+    child_meta = meta_event(
+        current,
+        session_id=FORKED_SESSION_ID,
+        timestamp="2026-08-11T12:00:00Z",
+    )
+    child_meta["payload"]["forked_from_id"] = SESSION_ID
+    write_jsonl(
+        transcript,
+        [
+            child_meta,
+            meta_event(current, timestamp="2026-08-03T13:27:51Z"),
+            {"timestamp": "2026-08-10T02:00:00Z", "type": "event_msg"},
+        ],
+    )
+
+    result = provider.discover(current)
+
+    assert [session.session_id for session in result.sessions] == [FORKED_SESSION_ID]
+    child = result.sessions[0]
+    assert child.updated_at == child.created_at
+    assert child.forked_from_id == SESSION_ID
+
+
+@pytest.mark.parametrize("final_newline", [True, False])
+def test_discover_metadata_only_uses_creation_timestamp(
+    codex_summary_file, final_newline
+):
+    provider, current, transcript = codex_summary_file
+    transcript.write_text(
+        json.dumps(meta_event(current)) + ("\n" if final_newline else ""),
+        encoding="utf-8",
+    )
+
+    result = provider.discover(current)
+
+    assert [session.session_id for session in result.sessions] == [SESSION_ID]
+    assert result.sessions[0].updated_at == result.sessions[0].created_at
+    assert result.warnings == ()
+
+
+@pytest.mark.parametrize(
+    ("suffix", "warning"),
+    [
+        (b'{}\n', None),
+        (b'[]\n', None),
+        (b'{"timestamp":"not-a-timestamp"}\n', None),
+        (b'\n \t\n', None),
+        (b'{invalid\n', "无效 JSON 行"),
+        (b'\xff\n', "无效 UTF-8"),
+        (b'{"timestamp":"2026-08-11T23:00:00Z"', "尚未完整写入"),
+    ],
+)
+def test_discover_tail_skips_unusable_records_to_previous_timestamp(
+    codex_summary_file, suffix, warning
+):
+    provider, current, transcript = codex_summary_file
+    write_jsonl(
+        transcript,
+        [
+            meta_event(current),
+            {"timestamp": "2026-08-11T02:00:00Z", "type": "event_msg"},
+        ],
+    )
+    with transcript.open("ab") as handle:
+        handle.write(suffix)
+
+    result = provider.discover(current)
+
+    assert [session.session_id for session in result.sessions] == [SESSION_ID]
+    assert result.sessions[0].updated_at.hour == 2
+    if warning is None:
+        assert result.warnings == ()
+    else:
+        assert any(warning in item for item in result.warnings)
+
+
+def test_discover_complete_final_record_without_newline(codex_summary_file):
+    provider, current, transcript = codex_summary_file
+    tail = {"timestamp": "2026-08-11T02:00:00Z", "type": "event_msg"}
+    transcript.write_text(
+        json.dumps(meta_event(current)) + "\n" + json.dumps(tail),
+        encoding="utf-8",
+    )
+
+    result = provider.discover(current)
+
+    assert result.sessions[0].updated_at.hour == 2
+    assert result.warnings == ()
+
+
+def test_discover_handles_long_utf8_tail_record_spanning_read_blocks(
+    codex_summary_file,
+):
+    provider, current, transcript = codex_summary_file
+    tail = {
+        "timestamp": "2026-08-11T02:00:00Z",
+        "type": "event_msg",
+        "payload": {"text": "中文🧪" * 100_001},
+    }
+    transcript.write_text(
+        json.dumps(meta_event(current))
+        + "\n"
+        + json.dumps(tail, ensure_ascii=False)
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = provider.discover(current)
+
+    assert result.sessions[0].updated_at.hour == 2
+    assert result.warnings == ()
+
+
+def test_discover_does_not_parse_large_middle_body(codex_summary_file, monkeypatch):
+    provider, current, transcript = codex_summary_file
+    middle = {
+        "timestamp": "2026-08-11T23:00:00Z",
+        "type": "event_msg",
+        "payload": {"text": "MIDDLE-BODY-" * 100_000},
+    }
+    write_jsonl(
+        transcript,
+        [
+            meta_event(current),
+            middle,
+            {"timestamp": "2026-08-11T02:00:00Z", "type": "event_msg"},
+        ],
+    )
+    original_loads = json.loads
+    parsed_records = []
+
+    def track_loads(value, *args, **kwargs):
+        marker = b"MIDDLE-BODY-" if isinstance(value, bytes) else "MIDDLE-BODY-"
+        assert marker not in value, "listing must not parse the middle conversation body"
+        parsed_records.append(value)
+        return original_loads(value, *args, **kwargs)
+
+    monkeypatch.setattr(codex_module.json, "loads", track_loads)
+
+    result = provider.discover(current)
+
+    assert result.sessions[0].updated_at.hour == 2
+    assert len(parsed_records) == 2
+    assert result.warnings == ()
+
+
+@pytest.mark.parametrize("append_case", ["new-record", "complete-partial-record"])
+def test_discover_ignores_appended_records_outside_opened_snapshot(
+    codex_summary_file, monkeypatch, append_case
+):
+    provider, current, transcript = codex_summary_file
+    write_jsonl(
+        transcript,
+        [
+            meta_event(current),
+            {"timestamp": "2026-08-11T02:00:00Z", "type": "event_msg"},
+        ],
+    )
+    if append_case == "complete-partial-record":
+        with transcript.open("ab") as handle:
+            handle.write(b'{"timestamp":"2026-08-11T23:00:00Z"')
+    original_fstat = codex_module.os.fstat
+    appended = False
+
+    def append_after_snapshot(file_descriptor):
+        nonlocal appended
+        snapshot = original_fstat(file_descriptor)
+        if not appended:
+            appended = True
+            with transcript.open("ab") as handle:
+                if append_case == "complete-partial-record":
+                    handle.write(b"}\n")
+                else:
+                    handle.write(
+                        json.dumps(
+                            {"timestamp": "2026-08-11T23:00:00Z", "type": "event_msg"}
+                        ).encode("utf-8")
+                        + b"\n"
+                    )
+        return snapshot
+
+    monkeypatch.setattr(codex_module.os, "fstat", append_after_snapshot)
+
+    result = provider.discover(current)
+
+    assert appended
+    assert result.sessions[0].updated_at.hour == 2
+    if append_case == "complete-partial-record":
+        assert any("尚未完整写入" in item for item in result.warnings)
+    else:
+        assert result.warnings == ()
+
+
+def test_discover_does_not_return_head_when_opened_snapshot_is_truncated(
+    codex_summary_file, monkeypatch
+):
+    provider, current, transcript = codex_summary_file
+    metadata_bytes = json.dumps(meta_event(current)).encode("utf-8") + b"\n"
+    write_jsonl(
+        transcript,
+        [
+            meta_event(current),
+            {"timestamp": "2026-08-11T02:00:00Z", "type": "event_msg"},
+        ],
+    )
+    original_fstat = codex_module.os.fstat
+    truncated = False
+
+    def truncate_after_snapshot(file_descriptor):
+        nonlocal truncated
+        snapshot = original_fstat(file_descriptor)
+        if not truncated:
+            truncated = True
+            transcript.write_bytes(metadata_bytes)
+        return snapshot
+
+    monkeypatch.setattr(codex_module.os, "fstat", truncate_after_snapshot)
+
+    result = provider.discover(current)
+
+    assert truncated
+    assert result.sessions == ()
+    assert any("被截断" in warning for warning in result.warnings)
+
+
+def test_codex_full_readers_still_report_invalid_middle_json(codex_summary_file):
+    provider, current, transcript = codex_summary_file
+    write_jsonl(
+        transcript,
+        [
+            meta_event(current),
+            {
+                "timestamp": "2026-08-11T01:00:00Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "request"}],
+                },
+            },
+            {
+                "timestamp": "2026-08-11T02:00:00Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": "answer"}],
+                },
+            },
+        ],
+        invalid_line=True,
+    )
+
+    discovered = provider.discover(current)
+    assert discovered.warnings == ()
+    session = discovered.sessions[0]
+    trace = provider.read_trace(session, all_turns=True)
+    conversation = provider.read_conversation(session)
+
+    assert any("无效 JSON 行" in warning for warning in trace.warnings)
+    assert any("无效 JSON 行" in warning for warning in conversation.warnings)
+    assert [event.content for event in trace.events] == ["request", "answer"]
+    assert [turn.user for turn in conversation.turns] == ["request"]
+    assert [turn.assistant for turn in conversation.turns] == ["answer"]
 
 
 @pytest.mark.parametrize("source", ["cli", "vscode"])

@@ -6,6 +6,9 @@ from pathlib import Path
 
 import pytest
 
+import sess.paths as paths_module
+import sess.providers.claude as claude_module
+import sess.providers.codex as codex_module
 from sess.errors import MetadataError, ProviderError, TargetError
 from sess.metadata import MetadataStore
 from sess.models import (
@@ -163,6 +166,139 @@ def test_catalog_defensively_excludes_sessions_from_child_directories(tmp_path):
     catalog = service.catalog()
 
     assert [session.session_id for session in catalog.sessions] == [CODEX_ID]
+
+
+def test_catalog_shares_directory_results_across_providers_and_service(
+    tmp_path, monkeypatch
+):
+    alias = tmp_path / "project-alias"
+    other = tmp_path / "other"
+    codex = make_session(Agent.CODEX, CODEX_ID, alias, 1)
+    claude = make_session(Agent.CLAUDE, CLAUDE_ID, alias, 2)
+    excluded_codex = make_session(Agent.CODEX, "excluded-codex", other, 3)
+    excluded_claude = make_session(Agent.CLAUDE, "excluded-claude", other, 4)
+    providers = (
+        StubProvider(Agent.CODEX, (codex, excluded_codex)),
+        StubProvider(Agent.CLAUDE, (claude, excluded_claude)),
+    )
+    service = SessionService(
+        tmp_path, providers, MetadataStore(tmp_path), CapturingRunner()
+    )
+    alias_path = paths_module.canonical_path(alias)
+    other_path = paths_module.canonical_path(other)
+    current_path = paths_module.canonical_path(service.project_dir)
+    calls: list[tuple[str, str]] = []
+
+    def fake_samefile(left, right):
+        calls.append((left, right))
+        return left == alias_path
+
+    def discover_codex(current_dir):
+        assert codex_module.same_directory(alias, current_dir)
+        assert not codex_module.same_directory(other, current_dir)
+        return DiscoveryResult(providers[0].sessions)
+
+    def discover_claude(current_dir):
+        assert claude_module.same_directory(alias, current_dir)
+        assert not claude_module.same_directory(other, current_dir)
+        return DiscoveryResult(providers[1].sessions)
+
+    monkeypatch.setattr(paths_module.os.path, "samefile", fake_samefile)
+    monkeypatch.setattr(providers[0], "discover", discover_codex)
+    monkeypatch.setattr(providers[1], "discover", discover_claude)
+
+    catalog = service.catalog()
+
+    assert [session.session_id for session in catalog.sessions] == [CLAUDE_ID, CODEX_ID]
+    assert calls == [(alias_path, current_path), (other_path, current_path)]
+
+
+def test_catalog_does_not_reuse_directory_results_from_previous_scan(
+    tmp_path, monkeypatch
+):
+    alias = tmp_path / "project-alias"
+    session = make_session(Agent.CODEX, CODEX_ID, alias, 1)
+    provider = StubProvider(Agent.CODEX, (session,))
+    service = SessionService(
+        tmp_path, (provider,), MetadataStore(tmp_path), CapturingRunner()
+    )
+    matches = True
+    calls: list[tuple[str, str]] = []
+
+    def fake_samefile(left, right):
+        calls.append((left, right))
+        return matches
+
+    monkeypatch.setattr(paths_module.os.path, "samefile", fake_samefile)
+
+    assert service.catalog().sessions == (session,)
+    matches = False
+    assert service.catalog().sessions == ()
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("error_type", [OSError, ProviderError])
+def test_catalog_restores_directory_scope_after_provider_warning(
+    tmp_path, monkeypatch, error_type
+):
+    alias = tmp_path / "project-alias"
+    session = make_session(Agent.CLAUDE, CLAUDE_ID, alias, 1)
+    codex = StubProvider(Agent.CODEX, ())
+    claude = StubProvider(Agent.CLAUDE, (session,))
+    service = SessionService(
+        tmp_path, (codex, claude), MetadataStore(tmp_path), CapturingRunner()
+    )
+    matches = True
+    calls: list[tuple[str, str]] = []
+
+    def fake_samefile(left, right):
+        calls.append((left, right))
+        return matches
+
+    def fail_discover(current_dir):
+        assert codex_module.same_directory(alias, current_dir)
+        raise error_type("provider unavailable")
+
+    def discover_claude(current_dir):
+        assert claude_module.same_directory(alias, current_dir)
+        return DiscoveryResult((session,), ("transcript warning",))
+
+    monkeypatch.setattr(paths_module.os.path, "samefile", fake_samefile)
+    monkeypatch.setattr(codex, "discover", fail_discover)
+    monkeypatch.setattr(claude, "discover", discover_claude)
+
+    catalog = service.catalog()
+
+    assert catalog.sessions == (session,)
+    assert catalog.warnings == ("codex: provider unavailable", "transcript warning")
+    assert len(calls) == 1
+    matches = False
+    assert not paths_module.same_directory(alias, service.project_dir)
+    assert len(calls) == 2
+
+
+def test_catalog_restores_directory_scope_after_unhandled_provider_error(
+    tmp_path, monkeypatch
+):
+    alias = tmp_path / "project-alias"
+    provider = StubProvider(Agent.CODEX, ())
+    service = SessionService(
+        tmp_path, (provider,), MetadataStore(tmp_path), CapturingRunner()
+    )
+    matches = True
+
+    def fail_discover(current_dir):
+        assert codex_module.same_directory(alias, current_dir)
+        raise RuntimeError("unexpected provider error")
+
+    monkeypatch.setattr(paths_module.os.path, "samefile", lambda _left, _right: matches)
+    monkeypatch.setattr(provider, "discover", fail_discover)
+
+    with pytest.raises(RuntimeError, match="unexpected provider error"):
+        service.catalog()
+
+    matches = False
+    assert not paths_module.same_directory(alias, service.project_dir)
 
 
 def test_resolve_uses_full_id_or_exact_name(tmp_path):
